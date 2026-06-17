@@ -9,7 +9,7 @@ import wandb
 
 from src.config import MODELS_DIR, PROCESSED_DATA_DIR
 from src.dataset import get_data, construct_dataloader, batch_to_dense
-from src.modeling.model import GaussianDiffusion, Denoiser, sample_timesteps
+from src.modeling.model import GaussianDiffusion, Linear_Denoiser, GAT_Denoiser, sample_timesteps
 
 app = typer.Typer()
 
@@ -68,7 +68,7 @@ def main(
     wandb_project: str = "graph-diffusion",
     wandb_entity: str | None = None,
     wandb_run_name: str | None = None,
-    wandb_mode: str = "online",
+    wandb_mode: str = "disabled",
     wandb_log_interval: int = 10,
     # -----------------------------------------
 ):
@@ -118,14 +118,14 @@ def main(
     logger.info("Training some model...")
 
     diffusion = GaussianDiffusion(num_steps=1000).to(device)
-    denoiser = Denoiser(
-        max_nodes=max_nodes,
-        encoder_dims=[1024, 512],
-        latent_dim=256,
-        decoder_dims=[1024, 512],
+    denoiser = GAT_Denoiser(
+        max_nodes=64,
         feature_dim=1433,
+        hidden_dim=128,
         time_emb_dim=32,
-        dropout=0.25,
+        num_layers=2,
+        num_heads=4,
+        dropout=0.0,
     ).to(device)
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=lr)

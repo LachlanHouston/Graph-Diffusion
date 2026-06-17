@@ -10,10 +10,9 @@ import networkx as nx
 
 from src.config import MODELS_DIR, PROCESSED_DATA_DIR, FIGURES_DIR
 from src.dataset import get_data, construct_dataloader, batch_to_dense
-from src.modeling.model import GaussianDiffusion, Denoiser
+from src.modeling.model import GaussianDiffusion, Linear_Denoiser, GAT_Denoiser
 
 app = typer.Typer()
-
 
 def symmetrize_adj(adj: torch.Tensor) -> torch.Tensor:
     """
@@ -77,9 +76,6 @@ def select_graphs_by_real_edge_fractions(
     """
     Select graph indices whose real edge counts are closest to evenly spaced
     fractions of the maximum real edge count.
-
-    For max_graphs=6, the target fractions are:
-        1/6, 2/6, 3/6, 4/6, 5/6, 6/6
 
     Selection is based only on the real graphs. The sampled graphs are then
     plotted using the same selected indices.
@@ -302,9 +298,9 @@ def plot_real_vs_sampled_batch(
 @app.command()
 def main(
     data_path: Path = PROCESSED_DATA_DIR / "cora",
-    model_path: Path = MODELS_DIR / "model.pt",
+    model_path: Path = MODELS_DIR / "linear_denoiser.pt",
     output_dir: Path = FIGURES_DIR / "sampling",
-    batch_size: int = 64,
+    batch_size: int = 32,
     max_nodes: int = 64,
     num_samples: int = 10_000,
     num_hops: int = 2,
@@ -329,8 +325,7 @@ def main(
     )
 
     diffusion = GaussianDiffusion(num_steps=1000).to(device)
-
-    denoiser = Denoiser(
+    denoiser = Linear_Denoiser(
         max_nodes=max_nodes,
         encoder_dims=[1024, 512],
         latent_dim=256,
@@ -356,6 +351,8 @@ def main(
     real_adj = mask_adj(real_adj, node_mask)
     real_adj = torch.maximum(real_adj, real_adj.transpose(1, 2))
 
+    B, N, _ = real_adj.shape
+
     logger.info(f"x shape: {x.shape}")
     logger.info(f"real adj shape: {real_adj.shape}")
     logger.info(f"node mask shape: {node_mask.shape}")
@@ -364,55 +361,47 @@ def main(
         samples = diffusion.sample(
             model=denoiser,
             x=x,
-            adj_shape=real_adj.shape,
+            adj_shape=[B, N, N],
             node_mask=node_mask,
             device=device,
         )
 
-    sample_adj = threshold_samples(samples, threshold=threshold)
-    sample_adj = mask_adj(sample_adj, node_mask)
-    real_edge_counts = count_upper_edges(real_adj, node_mask)
-
-    selected_indices, target_edges, _ = select_graphs_by_real_edge_fractions(
-        real_adj=real_adj,
-        node_mask=node_mask,
-        max_graphs=6,
-    )
-
-    logger.debug(f"Real adjacency matrix: \n{real_adj.detach()[0, :3, :3]}")
-    logger.debug(f"Sampled adjacency matrix: \n{sample_adj.detach()[0, :3, :3]}")
-
-    real_stats = graph_statistics(real_adj, node_mask)
-    sample_stats = graph_statistics(sample_adj, node_mask)
-    summary = summarize_stats(real_stats, sample_stats)
-
     output_dir.mkdir(parents=True, exist_ok=True)
+    test_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    
+    for threshold in test_thresholds:
+        sample_adj = threshold_samples(samples, threshold=threshold)
+        sample_adj = mask_adj(sample_adj, node_mask)
 
-    real_stats_path = output_dir / "real_graph_stats.csv"
-    sample_stats_path = output_dir / "sampled_graph_stats.csv"
-    summary_path = output_dir / "real_vs_sampled_summary.csv"
-    figure_path = output_dir / "real_vs_sampled_batch.png"
+        logger.debug(f"Real adjacency matrix: \n{real_adj.detach()[0, :3, :3]}")
+        logger.debug(f"Sampled adjacency matrix: \n{sample_adj.detach()[0, :3, :3]}")
 
-    real_stats.to_csv(real_stats_path, index=False)
-    sample_stats.to_csv(sample_stats_path, index=False)
-    summary.to_csv(summary_path, index=False)
+        real_stats = graph_statistics(real_adj, node_mask)
+        sample_stats = graph_statistics(sample_adj, node_mask)
+        summary = summarize_stats(real_stats, sample_stats)
 
-    plot_real_vs_sampled_batch(
-        real_adj=real_adj,
-        sample_adj=sample_adj,
-        node_mask=node_mask,
-        output_path=figure_path,
-        max_graphs=6,
-    )
+        threshold_tag = str(threshold).replace(".", "_")
+        real_stats_path = output_dir / f"real_graph_stats_threshold_{threshold_tag}.csv"
+        sample_stats_path = output_dir / f"sampled_graph_stats_threshold_{threshold_tag}.csv"
+        summary_path = output_dir / f"real_vs_sampled_summary_threshold_{threshold_tag}.csv"
+        figure_path = output_dir / f"real_vs_sampled_batch_threshold_{threshold_tag}.png"
 
-    logger.info("Real vs sampled graph statistics:")
-    logger.info(f"\n{summary}")
+        plot_real_vs_sampled_batch(
+            real_adj=real_adj,
+            sample_adj=sample_adj,
+            node_mask=node_mask,
+            output_path=figure_path,
+            max_graphs=6,
+        )
 
-    logger.success(f"Saved real stats to {real_stats_path}")
-    logger.success(f"Saved sampled stats to {sample_stats_path}")
-    logger.success(f"Saved summary to {summary_path}")
-    logger.success(f"Saved visualization to {figure_path}")
-    logger.success("Inference complete.")
+        logger.info("Real vs sampled graph statistics:")
+        logger.info(f"\n{summary}")
+
+        logger.success(f"Saved real stats to {real_stats_path}")
+        logger.success(f"Saved sampled stats to {sample_stats_path}")
+        logger.success(f"Saved summary to {summary_path}")
+        logger.success(f"Saved visualization to {figure_path}")
+        logger.success("Inference complete.")
 
 if __name__ == "__main__":
     app()

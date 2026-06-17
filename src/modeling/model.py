@@ -9,6 +9,8 @@ from torch import nn
 from torch import Tensor
 import torch.distributions as td
 
+from torch_geometric.nn import GATConv
+
 app = typer.Typer()
 
 def sample_timesteps(batch_size, num_steps, device):
@@ -260,7 +262,7 @@ class GaussianDiffusion(nn.Module):
         return res.expand(broadcast_shape)
 
     
-class Denoiser(nn.Module):
+class Linear_Denoiser(nn.Module):
     """
     Simple MLP denoiser for dense adjacency matrices.
 
@@ -411,6 +413,251 @@ class Denoiser(nn.Module):
         pred = self.decode(z, node_mask)
 
         return pred
+    
+class GAT_Denoiser(nn.Module):
+    """
+    GAT-based epsilon predictor for dense adjacency diffusion.
+
+    Input:
+        x:         [B, N, F]
+        adj_noisy: [B, N, N]
+        t:         [B]
+        node_mask: [B, N], optional
+
+    Output:
+        pred_noise: [B, N, N]
+    """
+
+    def __init__(
+        self,
+        max_nodes: int = 64,
+        feature_dim: int = 1433,
+        hidden_dim: int = 128,
+        time_emb_dim: int = 32,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        force_symmetric_output: bool = True,
+    ):
+        super().__init__()
+
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1.")
+
+        self.max_nodes = max_nodes
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.time_emb_dim = time_emb_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.force_symmetric_output = force_symmetric_output
+
+        self.time_embedding = SinusoidalTimeEmbedding(time_emb_dim)
+
+        self.node_input_proj = nn.Sequential(
+            nn.Linear(feature_dim + time_emb_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.gat_layers = nn.ModuleList()
+
+        if num_layers == 1:
+            self.gat_layers.append(
+                GATConv(
+                    in_channels=hidden_dim,
+                    out_channels=hidden_dim,
+                    heads=1,
+                    concat=False,
+                    dropout=dropout,
+                    edge_dim=1,
+                    add_self_loops=False,
+                )
+            )
+        else:
+            self.gat_layers.append(
+                GATConv(
+                    in_channels=hidden_dim,
+                    out_channels=hidden_dim,
+                    heads=num_heads,
+                    concat=True,
+                    dropout=dropout,
+                    edge_dim=1,
+                    add_self_loops=False,
+                )
+            )
+
+            for _ in range(num_layers - 2):
+                self.gat_layers.append(
+                    GATConv(
+                        in_channels=hidden_dim * num_heads,
+                        out_channels=hidden_dim,
+                        heads=num_heads,
+                        concat=True,
+                        dropout=dropout,
+                        edge_dim=1,
+                        add_self_loops=False,
+                    )
+                )
+
+            self.gat_layers.append(
+                GATConv(
+                    in_channels=hidden_dim * num_heads,
+                    out_channels=hidden_dim,
+                    heads=1,
+                    concat=False,
+                    dropout=dropout,
+                    edge_dim=1,
+                    add_self_loops=False,
+                )
+            )
+
+        edge_input_dim = 3 * hidden_dim + time_emb_dim + 1
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def _complete_edge_index_and_attr(
+        self,
+        adj_noisy: Tensor,
+        node_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Build a batched complete directed edge index over valid non-diagonal nodes.
+        """
+        B, N, _ = adj_noisy.shape
+        device = adj_noisy.device
+
+        node_ids = torch.arange(N, device=device)
+        src_local, dst_local = torch.meshgrid(node_ids, node_ids, indexing="ij")
+
+        pair_mask = src_local != dst_local
+
+        if node_mask is None:
+            node_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+
+        edge_indices = []
+        edge_attrs = []
+
+        for b in range(B):
+            valid_nodes = node_mask[b]
+            valid_pair_mask = pair_mask & valid_nodes[src_local] & valid_nodes[dst_local]
+
+            src = src_local[valid_pair_mask] + b * N
+            dst = dst_local[valid_pair_mask] + b * N
+
+            edge_indices.append(torch.stack([src, dst], dim=0))
+            edge_attrs.append(adj_noisy[b, src_local[valid_pair_mask], dst_local[valid_pair_mask]].unsqueeze(-1))
+
+        if len(edge_indices) == 0:
+            edge_index = torch.empty(2, 0, dtype=torch.long, device=device)
+            edge_attr = torch.empty(0, 1, dtype=adj_noisy.dtype, device=device)
+        else:
+            edge_index = torch.cat(edge_indices, dim=1)
+            edge_attr = torch.cat(edge_attrs, dim=0)
+
+        return edge_index, edge_attr
+
+    def encode_nodes(
+        self,
+        x: Tensor,
+        adj_noisy: Tensor,
+        t: Tensor,
+        node_mask: Tensor | None = None,
+    ) -> Tensor:
+        B, N, F = x.shape
+
+        if N != self.max_nodes:
+            raise ValueError(
+                f"Expected x and adj_noisy with N={self.max_nodes}, but got N={N}."
+            )
+
+        t_emb = self.time_embedding(t)
+        t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
+
+        h = torch.cat([x, t_node], dim=-1)
+        h = self.node_input_proj(h)
+
+        if node_mask is not None:
+            h = h * node_mask.unsqueeze(-1).float()
+
+        h_flat = h.reshape(B * N, self.hidden_dim)
+        edge_index, edge_attr = self._complete_edge_index_and_attr(adj_noisy, node_mask)
+
+        for gat_layer in self.gat_layers:
+            h_flat = gat_layer(h_flat, edge_index, edge_attr=edge_attr)
+            h_flat = torch.nn.functional.silu(h_flat)
+
+        h = h_flat.reshape(B, N, self.hidden_dim)
+
+        if node_mask is not None:
+            h = h * node_mask.unsqueeze(-1).float()
+
+        return h
+
+    def decode_edges(
+        self,
+        h: Tensor,
+        adj_noisy: Tensor,
+        t: Tensor,
+        node_mask: Tensor | None = None,
+    ) -> Tensor:
+        B, N, H = h.shape
+
+        h_i = h.unsqueeze(2).expand(B, N, N, H)
+        h_j = h.unsqueeze(1).expand(B, N, N, H)
+        h_pair = h_i * h_j
+
+        t_emb = self.time_embedding(t)
+        t_pair = t_emb[:, None, None, :].expand(B, N, N, self.time_emb_dim)
+
+        adj_pair = adj_noisy.unsqueeze(-1)
+
+        edge_input = torch.cat(
+            [h_i, h_j, h_pair, t_pair, adj_pair],
+            dim=-1,
+        )
+
+        pred = self.edge_mlp(edge_input).squeeze(-1)
+
+        if self.force_symmetric_output:
+            pred = 0.5 * (pred + pred.transpose(1, 2))
+
+        if node_mask is not None:
+            adj_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
+            pred = pred * adj_mask.float()
+
+        eye = torch.eye(N, device=pred.device).unsqueeze(0)
+        pred = pred * (1.0 - eye)
+
+        return pred
+
+    def forward(
+        self,
+        x: Tensor,
+        adj_noisy: Tensor,
+        t: Tensor,
+        node_mask: Tensor | None = None,
+    ) -> Tensor:
+        h = self.encode_nodes(
+            x=x,
+            adj_noisy=adj_noisy,
+            t=t,
+            node_mask=node_mask,
+        )
+        pred = self.decode_edges(
+            h=h,
+            adj_noisy=adj_noisy,
+            t=t,
+            node_mask=node_mask,
+        )
+        return pred
 
 @app.command()
 def main():
@@ -440,14 +687,14 @@ def main():
 
     adj_noised, noise = diffusion.q_sample(x0=adj, t=t)
 
-    model = Denoiser(
-        max_nodes=N,
-        encoder_dims=[1024],
-        latent_dim=512,
-        decoder_dims=[1024],
-        feature_dim=F,
-        time_emb_dim=16,
-        dropout=0.1,
+    model = GAT_Denoiser(
+        max_nodes=64,
+        feature_dim=1433,
+        hidden_dim=128,
+        time_emb_dim=32,
+        num_layers=2,
+        num_heads=4,
+        dropout=0.0,
     ).to(device)
 
     pred_noise = model(x_feat, adj_noised, t, node_mask)
@@ -460,7 +707,7 @@ def main():
     sampled = diffusion.sample(
         model=model,
         x=x_feat,
-        adj_shape=(B, N, N),
+        adj_shape=(1, N, N),
         node_mask=node_mask,
         device=device,
     )

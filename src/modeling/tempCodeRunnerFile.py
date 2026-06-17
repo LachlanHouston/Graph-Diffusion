@@ -1,2 +1,0 @@
-
-    epoch_bar = tqdm(
