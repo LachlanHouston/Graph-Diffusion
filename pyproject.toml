@@ -1,0 +1,58 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "src"
+version = "0.0.1"
+description = "Project for exploring Graph Diffusion"
+authors = [
+  { name = "Lachlan Houston" },
+]
+
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    
+]
+dependencies = [
+    "loguru",
+    "matplotlib>=3.10.8",
+    "mkdocs",
+    "networkx>=3.6.1",
+    "numpy==1.26.4",
+    "pandas>=3.0.3",
+    "pip",
+    "python-dotenv",
+    "ruff",
+    "torch==2.5.1",
+    "torch-geometric>=2.8.0",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.20.1",
+    "tqdm",
+    "typer",
+    "wandb>=0.27.2",
+    "weave>=0.52.43",
+]
+requires-python = "==3.11.1"
+
+
+[tool.ruff]
+line-length = 99
+src = ["src"]
+include = ["pyproject.toml", "src/**/*.py"]
+
+[tool.ruff.lint]
+extend-select = ["I"]  # Add import sorting
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+force-sort-within-sections = true
+
+[tool.uv]
+environments = [
+    "sys_platform == 'darwin'"
+]
+
+[tool.uv.extra-build-dependencies]
+torch-scatter = ["torch"]
