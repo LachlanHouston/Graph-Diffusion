@@ -697,7 +697,7 @@ def main():
         dropout=0.0,
     ).to(device)
 
-    pred_noise = model(x_feat, adj_noised, t, node_mask)
+    pred_noise = model(x_feat, adj_noised, t)
     x0_pred = diffusion.predict_x0_from_noise(adj_noised, t, pred_noise)
 
     logger.debug(f"Adjacency Matrix: \n {adj[0, :3, :3]}")
@@ -710,7 +710,7 @@ def main():
         model=model,
         x=x_feat[:1],
         adj_shape=(1, N, N),
-        node_mask=node_mask[:1],
+        # node_mask=node_mask[:1],
         device=device,
     )
 

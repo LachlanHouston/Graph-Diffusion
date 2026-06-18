@@ -298,7 +298,7 @@ def plot_real_vs_sampled_batch(
 @app.command()
 def main(
     data_path: Path = PROCESSED_DATA_DIR / "cora",
-    model_path: Path = MODELS_DIR / "model.pt",
+    model_path: Path = MODELS_DIR / "GAT_denoiser.pt",
     output_dir: Path = FIGURES_DIR / "sampling",
     batch_size: int = 32,
     max_nodes: int = 64,
@@ -367,9 +367,11 @@ def main(
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    test_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    # test_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    test_thresholds = [0.5]
     
     for threshold in test_thresholds:
+        logger.info(f"Stastics and plot for threshold = {threshold}...")
         sample_adj = threshold_samples(samples, threshold=threshold)
         sample_adj = mask_adj(sample_adj, node_mask)
 
@@ -394,7 +396,6 @@ def main(
             max_graphs=6,
         )
 
-        logger.info("Real vs sampled graph statistics:")
         logger.info(f"\n{summary}")
 
         logger.success(f"Saved real stats to {real_stats_path}")
