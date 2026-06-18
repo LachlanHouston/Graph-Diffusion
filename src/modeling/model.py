@@ -698,23 +698,30 @@ def main():
     ).to(device)
 
     pred_noise = model(x_feat, adj_noised, t, node_mask)
+    x0_pred = diffusion.predict_x0_from_noise(adj_noised, t, pred_noise)
 
     logger.debug(f"Adjacency Matrix: \n {adj[0, :3, :3]}")
     logger.debug(f"Noised Adjacency Matrix: \n {adj_noised[0, :3, :3]}")
     logger.debug(f"Noise: \n {noise[0, :3, :3]}")
     logger.debug(f"Predicted Noise: \n {pred_noise.detach()[0, :3, :3]}")
+    logger.debug(f"Predicted x0: \n {x0_pred.detach()[0, :3, :3]}")
 
     sampled = diffusion.sample(
         model=model,
-        x=x_feat,
+        x=x_feat[:1],
         adj_shape=(1, N, N),
-        node_mask=node_mask,
+        node_mask=node_mask[:1],
         device=device,
     )
 
     sampled = 0.5 * (sampled + sampled.transpose(1, 2))
 
     logger.debug(f"Sampled Adjacency Matrix: \n {sampled.detach()[0, :3, :3]}")
+
+    m = nn.Sigmoid()
+    bce_loss = nn.BCEWithLogitsLoss()
+    loss = bce_loss(x0_pred, adj)
+    logger.debug(f"BCE Loss: {loss.detach():2.3f}")
 
     logger.success("Model construction complete.")
     # -----------------------------------------

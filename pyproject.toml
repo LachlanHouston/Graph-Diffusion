@@ -25,6 +25,7 @@ dependencies = [
     "pip",
     "python-dotenv",
     "ruff",
+    "scikit-learn>=1.9.0",
     "torch==2.5.1",
     "torch-geometric>=2.8.0",
     "torchaudio>=2.11.0",

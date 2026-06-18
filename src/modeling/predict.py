@@ -298,7 +298,7 @@ def plot_real_vs_sampled_batch(
 @app.command()
 def main(
     data_path: Path = PROCESSED_DATA_DIR / "cora",
-    model_path: Path = MODELS_DIR / "linear_denoiser.pt",
+    model_path: Path = MODELS_DIR / "model.pt",
     output_dir: Path = FIGURES_DIR / "sampling",
     batch_size: int = 32,
     max_nodes: int = 64,
@@ -325,14 +325,14 @@ def main(
     )
 
     diffusion = GaussianDiffusion(num_steps=1000).to(device)
-    denoiser = Linear_Denoiser(
-        max_nodes=max_nodes,
-        encoder_dims=[1024, 512],
-        latent_dim=256,
-        decoder_dims=[1024, 512],
+    denoiser = GAT_Denoiser(
+        max_nodes=64,
         feature_dim=1433,
+        hidden_dim=128,
         time_emb_dim=32,
-        dropout=0.25,
+        num_layers=2,
+        num_heads=4,
+        dropout=0.0,
     ).to(device)
 
     ckpt = torch.load(model_path, map_location=device)
