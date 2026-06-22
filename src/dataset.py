@@ -13,10 +13,10 @@ import torch
 from torch_geometric.utils import k_hop_subgraph
 from torch_geometric.data import Data
 from torch_geometric.datasets import Planetoid
-from torch_geometric.loader import DataLoader
+from torch_geometric.loader import DataLoader, LinkNeighborLoader
 from torch.utils.data import Dataset
 
-DATASET = "Cora"
+DATASET = "PubMed"
 
 app = typer.Typer()
 
@@ -34,6 +34,7 @@ def get_data(path: Path):
     dataset = Planetoid(
         root=path,
         name=DATASET,
+        split="full",
         transform=T.NormalizeFeatures(),
     )
 
@@ -172,20 +173,18 @@ def batch_to_dense(batch, max_nodes: int = 64, batch_size: int | None = None):
 @app.command()
 def main(
     # ---- REPLACE DEFAULT PATHS AS APPROPRIATE ----
-    input_path: Path = RAW_DATA_DIR / "cora",
-    output_path: Path = PROCESSED_DATA_DIR / "cora",
+    input_path: Path = RAW_DATA_DIR / DATASET,
+    output_path: Path = PROCESSED_DATA_DIR / DATASET,
     # ----------------------------------------------
 ):
     data = get_data(output_path)
-
-    loader = construct_dataloader(
+    loader = LinkNeighborLoader(
         data,
-        num_samples=10_000,
-        num_hops=2,
-        max_nodes=64,
-        min_nodes=8,
+        # Sample 30 neighbors for each node for 2 iterations
+        num_neighbors=4,
+        # Use a batch size of 128 for sampling training nodes
         batch_size=32,
-        shuffle=True,
+        edge_label_index=data.edge_index,
     )
 
     batch = next(iter(loader))
@@ -194,11 +193,16 @@ def main(
     print(batch.x.shape)
     print(batch.edge_index.shape)
 
-    x, adj, node_mask = batch_to_dense(batch, max_nodes=64)
+    x, adj, node_mask = batch_to_dense(batch, max_nodes=64, batch_size=1)
 
     print("x:", x.shape)
     print("adj:", adj.shape)
     print("mask:", node_mask.shape)
+
+    num_batches = 0
+    for i, _ in enumerate(loader):
+        num_batches += 1
+    print(num_batches)
 
     print("Done Testing!")
 

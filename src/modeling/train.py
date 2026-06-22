@@ -7,8 +7,8 @@ import typer
 import torch
 import wandb
 
-from src.config import MODELS_DIR, PROCESSED_DATA_DIR
-from src.dataset import get_data, construct_dataloader, batch_to_dense
+from src.config import MODELS_DIR, PROCESSED_DATA_DIR, FIGURES_DIR
+from src.dataset import get_data, construct_dataloader, batch_to_dense, DATASET
 from src.modeling.model import GaussianDiffusion, Linear_Denoiser, GAT_Denoiser, sample_timesteps
 from src.modeling.utils import (
     log_samples,
@@ -17,12 +17,14 @@ from src.modeling.utils import (
     symmetric_noise_like,
 )
 
+from torch_geometric.loader import LinkNeighborLoader
+
 app = typer.Typer()
 
 @app.command()
 def main(
     # ---- REPLACE DEFAULT PATHS AS APPROPRIATE ----
-    data_path: Path = PROCESSED_DATA_DIR / "cora",
+    data_path: Path = PROCESSED_DATA_DIR / DATASET,
     model_path: Path = MODELS_DIR / "model.pt",
     max_epochs: int = 10,
     batch_size: int = 32,
@@ -31,30 +33,28 @@ def main(
     num_hops: int = 2,
     min_nodes: int = 8,
     lr: float = 1e-4,
-    x0_scale: float = 0.25,
+    dropout: float = 0.1,
+    x0_scale: float = 0.2,
     wandb_project: str = "graph-diffusion",
     wandb_entity: str | None = None,
-    wandb_run_name: str | None = None,
+    wandb_run_name: str = "local_mac_run",
     wandb_mode: str = "disabled",
     wandb_log_interval: int = 10,
     sample_every: int = 5,
-    sample_graphs: int = 2,
-    sample_threshold: float = 0.4,
+    sample_graphs: int = 1,
+    sample_threshold: float = 0.2,
     use_node_mask: bool = False,
     # -----------------------------------------
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data = get_data(data_path)
 
-    train_loader = construct_dataloader(data, 
-                                        num_samples=num_samples, 
-                                        num_hops=num_hops, 
-                                        max_nodes=max_nodes, 
-                                        min_nodes=min_nodes, 
-                                        seed=0, 
-                                        batch_size=batch_size, 
-                                        shuffle=True,
-                                        )
+    train_loader = LinkNeighborLoader(
+        data,
+        num_neighbors=[5],
+        batch_size=batch_size,
+        edge_label_index=data.edge_index,
+    )
 
     config = {
         "data_path": str(data_path),
@@ -72,11 +72,10 @@ def main(
         "encoder_dims": [1024, 512],
         "latent_dim": 256,
         "decoder_dims": [1024, 512],
-        "feature_dim": 1433,
+        "feature_dim": data.num_features,
         "time_emb_dim": 32,
-        "dropout": 0.25,
+        "dropout": dropout,
         "optimizer": "Adam",
-        "loss": "masked_upper_mse_epsilon_prediction",
         "sample_every": sample_every,
         "sample_graphs": sample_graphs,
         "sample_threshold": sample_threshold,
@@ -96,12 +95,12 @@ def main(
     diffusion = GaussianDiffusion(num_steps=1000).to(device)
     denoiser = GAT_Denoiser(
         max_nodes=64,
-        feature_dim=1433,
+        feature_dim=data.num_features,
         hidden_dim=128,
         time_emb_dim=32,
         num_layers=2,
         num_heads=4,
-        dropout=0.0,
+        dropout=dropout,
     ).to(device)
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=lr)
@@ -133,7 +132,7 @@ def main(
         for step, batch in enumerate(batch_bar, start=1):
             batch = batch.to(device)
 
-            x, adj, node_mask = batch_to_dense(batch, max_nodes=max_nodes, batch_size=batch_size)
+            x, adj, node_mask = batch_to_dense(batch, max_nodes=None, batch_size=1)
             x = x.to(device).float()
             adj = adj.to(device).float()
             node_mask = node_mask.to(device)
@@ -223,14 +222,14 @@ def main(
         )
 
         if (
-            wandb_mode != "disabled"
-            and sample_every > 0
+            sample_every > 0
             and epoch % sample_every == 0
             and latest_x is not None
             and latest_adj is not None
             and latest_node_mask is not None
         ):
             log_samples(
+                wandb_mode=wandb_mode,
                 denoiser=denoiser,
                 diffusion=diffusion,
                 x=latest_x,
@@ -241,6 +240,7 @@ def main(
                 threshold=sample_threshold,
                 num_graphs=sample_graphs,
                 device=device,
+                figure_path=FIGURES_DIR / f"train_output_{epoch}.png"
             )
 
     logger.success("Modeling training complete.")

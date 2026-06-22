@@ -121,8 +121,8 @@ def make_sample_figure(real_adj, sampled_adj, node_mask, num_graphs=2):
         real_graph = graph_from_adjacency(real_adj[graph_idx], node_mask[graph_idx])
         sampled_graph = graph_from_adjacency(sampled_adj[graph_idx], node_mask[graph_idx])
 
-        real_pos = nx.spring_layout(real_graph, seed=42)
-        sampled_pos = nx.spring_layout(sampled_graph, seed=42)
+        real_pos = nx.spring_layout(real_graph, k=0.25, seed=42)
+        sampled_pos = nx.spring_layout(sampled_graph, k=0.25, seed=42)
 
         ax = axes[0, graph_idx]
         nx.draw_networkx(
@@ -156,7 +156,7 @@ def make_sample_figure(real_adj, sampled_adj, node_mask, num_graphs=2):
 
 
 @torch.no_grad()
-def log_samples(denoiser, diffusion, x, real_adj, node_mask, epoch, global_step, threshold, num_graphs, device):
+def log_samples(wandb_mode, denoiser, diffusion, x, real_adj, node_mask, epoch, global_step, threshold, num_graphs, device, figure_path):
     was_training = denoiser.training
     denoiser.eval()
 
@@ -193,6 +193,9 @@ def log_samples(denoiser, diffusion, x, real_adj, node_mask, epoch, global_step,
         },
         step=global_step,
     )
+
+    if wandb_mode != "online":
+        plt.savefig(figure_path, dpi=200, bbox_inches="tight")
 
     plt.close(fig)
 

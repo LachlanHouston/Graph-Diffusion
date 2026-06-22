@@ -573,10 +573,10 @@ class GAT_Denoiser(nn.Module):
     ) -> Tensor:
         B, N, F = x.shape
 
-        if N != self.max_nodes:
-            raise ValueError(
-                f"Expected x and adj_noisy with N={self.max_nodes}, but got N={N}."
-            )
+        # if N != self.max_nodes:
+        #     raise ValueError(
+        #         f"Expected x and adj_noisy with N={self.max_nodes}, but got N={N}."
+        #     )
 
         t_emb = self.time_embedding(t)
         t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)

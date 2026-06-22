@@ -6,11 +6,12 @@ from matplotlib.lines import Line2D
 import networkx as nx
 import torch
 from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataLoader, ShaDowKHopSampler, LinkNeighborLoader
 from torch_geometric.utils import to_networkx
 import typer
 
 from src.config import FIGURES_DIR, PROCESSED_DATA_DIR
-from src.dataset import construct_dataloader, get_data
+from src.dataset import batch_to_dense, construct_dataloader, get_data, DATASET
 
 app = typer.Typer()
 
@@ -24,11 +25,17 @@ CORA_LABEL_NAMES = {
     6: "Rule Learning",
 }
 
+PUBMED_LABEL_NAMES = {
+    0: "Diabetes Mellitus, Experimental",
+    1: "Diabetes Mellitus, Type 1",
+    2: "Diabetes Mellitus, Type 2",
+}
+
 
 def cora_label_color(label: int):
     """Return the fixed matplotlib color for a Cora class label."""
     cmap = plt.get_cmap("tab10")
-    return cmap(int(label) % 10)
+    return cmap(int(label) % 4)
 
 
 def graph_title(graph: Data, graph_idx: int) -> str:
@@ -71,7 +78,7 @@ def draw_subgraph(ax: plt.Axes, graph: Data, graph_idx: int, seed: int = 42) -> 
         pos=pos,
         ax=ax,
         node_size=55,
-        node_color=node_colors,
+        # node_color=node_colors,
         linewidths=0.4,
         edgecolors="black",
     )
@@ -79,6 +86,26 @@ def draw_subgraph(ax: plt.Axes, graph: Data, graph_idx: int, seed: int = 42) -> 
     ax.set_title(graph_title(graph, graph_idx), fontsize=9)
     ax.set_axis_off()
 
+
+def graphs_from_loader_output(batch: Batch | Data) -> list[Data]:
+    """
+    Convert a loader output into a list of graphs for visualization.
+
+    Standard PyG DataLoader batches can be reconstructed with `to_data_list()`.
+    ShaDowKHopSampler returns one sampled Data/Batch-like object that was not
+    created by `Batch.from_data_list()`, so `to_data_list()` cannot be used.
+    In that case, visualize the sampled object as one merged subgraph.
+    """
+    try:
+        return batch.to_data_list()
+    except (RuntimeError, AttributeError):
+        graph = Data(
+            x=batch.x,
+            edge_index=batch.edge_index,
+            y=batch.y if hasattr(batch, "y") else None,
+            num_nodes=batch.num_nodes,
+        )
+        return [graph]
 
 def add_cora_label_legend(fig: plt.Figure, batch: Batch) -> None:
     """Add a legend explaining what the Cora node colors represent."""
@@ -124,8 +151,7 @@ def visualize_batch(
     seed: int = 42,
 ) -> None:
     """Visualize a PyG batch as a grid of sampled subgraphs."""
-    graphs = batch.to_data_list()
-    graphs = graphs[:max_graphs]
+    graphs = graphs_from_loader_output(batch)
 
     labels_in_plotted_graphs = []
     for graph in graphs:
@@ -166,16 +192,16 @@ def visualize_batch(
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-
 @app.command()
 def main(
-    input_path: Path = PROCESSED_DATA_DIR / "cora",
-    output_path: Path = FIGURES_DIR / "cora_subgraph_batch.png",
+    input_path: Path = PROCESSED_DATA_DIR / DATASET,
+    output_path: Path = FIGURES_DIR / f"{DATASET}_subgraph_batch.png",
+    dense_output_path: Path = FIGURES_DIR / f"{DATASET}_dense_batch.png",
     batch_size: int = 9,
     max_graphs: int = 9,
     num_samples: int = 128,
     num_hops: int = 2,
-    max_nodes: int = 128,
+    max_nodes: int = 32,
     min_nodes: int = 8,
     seed: int = 0,
 ):
@@ -183,27 +209,25 @@ def main(
     data = get_data(input_path)
 
     logger.info("Constructing subgraph dataloader...")
-    loader = construct_dataloader(
-        data=data,
-        num_samples=num_samples,
-        num_hops=num_hops,
-        max_nodes=max_nodes,
-        min_nodes=min_nodes,
+
+    loader = LinkNeighborLoader(
+        data,
+        num_neighbors=[5],
         batch_size=batch_size,
-        shuffle=False,
-        seed=seed,
+        edge_label_index=data.edge_index,
     )
 
     logger.info("Fetching one batch of sampled subgraphs...")
     batch = next(iter(loader))
 
-    logger.info(f"Batch contains {batch.num_graphs} graphs")
-    logger.info(f"Total nodes in batch: {batch.num_nodes}")
-    logger.info(f"Total directed edges in batch: {batch.edge_index.size(1)}")
+    graphs = graphs_from_loader_output(batch)
+    logger.info(f"Loader output contains {len(graphs)} visualizable graph object(s)")
+    logger.info(f"Total nodes in loader output: {batch.num_nodes}")
+    logger.info(f"Total directed edges in loader output: {batch.edge_index.size(1)}")
 
     labels_present = sorted(batch.y.detach().cpu().unique().tolist())
     label_text = ", ".join(
-        f"{int(label)}={CORA_LABEL_NAMES.get(int(label), f'Class {int(label)}')}"
+        f"{int(label)}={PUBMED_LABEL_NAMES.get(int(label), f'Class {int(label)}')}"
         for label in labels_present
     )
     logger.info(f"Paper classes present in batch: {label_text}")
