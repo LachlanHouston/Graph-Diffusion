@@ -6,36 +6,95 @@ import typer
 
 from src.config import PROCESSED_DATA_DIR, RAW_DATA_DIR
 import torch_geometric.transforms as T
-from torch_geometric.utils import to_dense_adj
-from torch_geometric.utils import to_dense_batch
+from torch_geometric.utils import to_dense_adj, to_dense_batch, remove_self_loops, k_hop_subgraph, subgraph
 
 import torch
-from torch_geometric.utils import k_hop_subgraph
 from torch_geometric.data import Data
 from torch_geometric.datasets import Planetoid
-from torch_geometric.loader import DataLoader, LinkNeighborLoader
-from torch.utils.data import Dataset
+from torch_geometric.loader import DataLoader
 
-DATASET = "PubMed"
+DATASET = "Citeseer"
 
 app = typer.Typer()
 
-CORA_LABEL_NAMES = {
-    0: "Theory",
-    1: "Reinforcement Learning",
-    2: "Genetic Algorithms",
-    3: "Neural Networks",
-    4: "Probabilistic Methods",
-    5: "Case Based",
-    6: "Rule Learning",
-}
+
+def connected_node_subset(edge_index, center_local: int, num_nodes: int, max_nodes: int):
+    if num_nodes <= max_nodes:
+        return torch.arange(num_nodes, dtype=torch.long, device=edge_index.device)
+
+    neighbors = [[] for _ in range(num_nodes)]
+    src_nodes = edge_index[0].detach().cpu().tolist()
+    dst_nodes = edge_index[1].detach().cpu().tolist()
+
+    for src, dst in zip(src_nodes, dst_nodes):
+        neighbors[src].append(dst)
+        neighbors[dst].append(src)
+
+    visited = {int(center_local)}
+    queue = [int(center_local)]
+    selected = []
+
+    while queue and len(selected) < max_nodes:
+        node = queue.pop(0)
+        selected.append(node)
+
+        for neighbor in neighbors[node]:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append(neighbor)
+
+    return torch.tensor(selected, dtype=torch.long, device=edge_index.device)
+
+
+def largest_connected_component(edge_index, num_nodes: int):
+    neighbors = [[] for _ in range(num_nodes)]
+    src_nodes = edge_index[0].detach().cpu().tolist()
+    dst_nodes = edge_index[1].detach().cpu().tolist()
+
+    for src, dst in zip(src_nodes, dst_nodes):
+        neighbors[src].append(dst)
+        neighbors[dst].append(src)
+
+    visited = set()
+    components = []
+
+    for start in range(num_nodes):
+        if start in visited:
+            continue
+
+        queue = [start]
+        visited.add(start)
+        component = []
+
+        while queue:
+            node = queue.pop(0)
+            component.append(node)
+
+            for neighbor in neighbors[node]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+
+        components.append(component)
+
+    largest = max(components, key=len)
+    return torch.tensor(largest, dtype=torch.long, device=edge_index.device)
+
 
 def get_data(path: Path):
+    logger.info(f"Loading {DATASET}.")
+
+    transform = T.Compose([
+        T.RandomNodeSplit(num_val=500, num_test=500),
+        T.RemoveIsolatedNodes(),
+        T.NormalizeFeatures(),
+    ])
+
     dataset = Planetoid(
         root=path,
         name=DATASET,
         split="full",
-        transform=T.NormalizeFeatures(),
+        transform=transform,
     )
 
     data = dataset[0]
@@ -50,74 +109,67 @@ def get_data(path: Path):
 
     return data
 
-class KHopSubgraphDataset(Dataset):
-    def __init__(
-        self,
-        data: Data,
-        num_samples: int = 10_000,
-        num_hops: int = 2,
-        max_nodes: int = 64,
-        min_nodes: int = 8,
-        seed: int = 0,
-    ):
-        self.data = data
-        self.num_samples = num_samples
-        self.num_hops = num_hops
-        self.max_nodes = max_nodes
-        self.min_nodes = min_nodes
 
-        generator = torch.Generator()
-        generator.manual_seed(seed)
+def extract_k_hop(data, root_node, num_hops=2, max_nodes: int = 64, min_nodes: int = 2):
+    subset, edge_index, mapping, edge_mask = k_hop_subgraph(
+        node_idx=int(root_node),
+        num_hops=num_hops,
+        edge_index=data.edge_index,
+        relabel_nodes=True,
+        num_nodes=data.num_nodes,
+    )
 
-        self.center_nodes = torch.randint(
-            low=0,
-            high=data.num_nodes,
-            size=(num_samples,),
-            generator=generator,
+    if subset.numel() > max_nodes:
+        keep_local = connected_node_subset(
+            edge_index=edge_index,
+            center_local=int(mapping.item()),
+            num_nodes=subset.numel(),
+            max_nodes=max_nodes,
         )
+        subset = subset[keep_local]
 
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        center = int(self.center_nodes[idx])
-
-        subset, edge_index_sub, mapping, edge_mask = k_hop_subgraph(
-            node_idx=center,
-            num_hops=self.num_hops,
-            edge_index=self.data.edge_index,
+        edge_index, edge_mask = subgraph(
+            subset=subset,
+            edge_index=data.edge_index,
             relabel_nodes=True,
-            num_nodes=self.data.num_nodes,
+            num_nodes=data.num_nodes,
+        )
+    else:
+        edge_attr_mask = edge_mask
+
+    if subset.numel() < min_nodes:
+        return None
+
+    component_local = largest_connected_component(
+        edge_index=edge_index,
+        num_nodes=subset.numel(),
+    )
+
+    if component_local.numel() < min_nodes:
+        return None
+
+    if component_local.numel() < subset.numel():
+        subset = subset[component_local]
+        edge_index, edge_mask = subgraph(
+            subset=subset,
+            edge_index=data.edge_index,
+            relabel_nodes=True,
+            num_nodes=data.num_nodes,
         )
 
-        # Optional: keep subgraphs small for dense adjacency diffusion.
-        if subset.numel() > self.max_nodes:
-            perm = torch.randperm(subset.numel())[: self.max_nodes]
-            subset = subset[perm]
+    sub_data = Data(
+        x=data.x[subset],
+        edge_index=edge_index,
+        y=data.y[subset],
+        original_node_ids=subset,
+        num_nodes=subset.numel(),
+    )
 
-            # Rebuild induced subgraph from the selected subset.
-            subset, edge_index_sub, mapping, edge_mask = k_hop_subgraph(
-                node_idx=subset,
-                num_hops=0,
-                edge_index=self.data.edge_index,
-                relabel_nodes=True,
-                num_nodes=self.data.num_nodes,
-            )
+    if data.edge_attr is not None:
+        sub_data.edge_attr = data.edge_attr[edge_mask]
 
-        # Avoid extremely tiny samples
-        if subset.numel() < self.min_nodes:
-            return self.__getitem__((idx + 1) % len(self))
+    return sub_data
 
-        x_sub = self.data.x[subset]
-        y_sub = self.data.y[subset]
-
-        return Data(
-            x=x_sub,
-            edge_index=edge_index_sub,
-            y=y_sub,
-            num_nodes=x_sub.size(0),
-            center_node=mapping,
-        )
     
 def construct_dataloader(
     data,
@@ -129,14 +181,35 @@ def construct_dataloader(
     batch_size: int = 32,
     shuffle: bool = False,
 ):
-    train_dataset = KHopSubgraphDataset(
-        data=data,
-        num_samples=num_samples,
-        num_hops=num_hops,
-        max_nodes=max_nodes,
-        min_nodes=min_nodes,
-        seed=seed,
-    )
+    train_nodes = data.train_mask.nonzero(as_tuple=False).view(-1)
+
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(train_nodes.numel(), generator=generator)
+
+    sample_nodes = train_nodes[perm]
+
+    subgraphs = []
+    for root_node in sample_nodes:
+        subgraph_data = extract_k_hop(
+            data=data,
+            root_node=root_node,
+            num_hops=num_hops,
+            max_nodes=max_nodes,
+            min_nodes=min_nodes,
+        )
+
+        if subgraph_data is None:
+            continue
+
+        subgraphs.append(subgraph_data)
+
+        if len(subgraphs) >= num_samples:
+            break
+
+    if len(subgraphs) == 0:
+        raise ValueError(
+            f"No connected k-hop subgraphs found with min_nodes={min_nodes} and max_nodes={max_nodes}."
+        )
 
     logger.info(
         f"Using KHopSubgraphDataset with num_samples={num_samples}, "
@@ -145,30 +218,83 @@ def construct_dataloader(
     )
 
     return DataLoader(
-        train_dataset,
+        subgraphs,
         batch_size=batch_size,
         shuffle=shuffle,
     )
-    
-def batch_to_dense(batch, max_nodes: int = 64, batch_size: int | None = None):
-    if batch_size is None:
-        batch_size = int(batch.batch.max().item()) + 1
 
-    x_dense, node_mask = to_dense_batch(
-        batch.x,
-        batch.batch,
-        max_num_nodes=max_nodes,
-        batch_size=batch_size,
+
+def to_dense(
+    x,
+    edge_index,
+    edge_attr,
+    batch,
+    min_nodes: int = 1,
+    max_nodes: int | None = None,
+):
+    num_graphs = int(batch.max().item()) + 1
+    node_counts = torch.bincount(batch, minlength=num_graphs)
+    keep_graph = node_counts >= min_nodes
+
+    if keep_graph.sum() == 0:
+        raise ValueError(
+            f"No graphs in this batch have at least {min_nodes} nodes. "
+            f"Node counts were: {node_counts.tolist()}"
+        )
+
+    graph_id_map = torch.full(
+        size=(num_graphs,),
+        fill_value=-1,
+        dtype=torch.long,
+        device=batch.device,
+    )
+    graph_id_map[keep_graph] = torch.arange(
+        keep_graph.sum(),
+        dtype=torch.long,
+        device=batch.device,
     )
 
-    adj_dense = to_dense_adj(
-        batch.edge_index,
-        batch=batch.batch,
-        max_num_nodes=max_nodes,
-        batch_size=batch_size,
+    keep_node = keep_graph[batch]
+    old_to_new_node = torch.full(
+        size=(x.size(0),),
+        fill_value=-1,
+        dtype=torch.long,
+        device=x.device,
+    )
+    old_to_new_node[keep_node] = torch.arange(
+        keep_node.sum(),
+        dtype=torch.long,
+        device=x.device,
     )
 
-    return x_dense, adj_dense, node_mask
+    x = x[keep_node]
+    batch = graph_id_map[batch[keep_node]]
+
+    edge_index, edge_attr = remove_self_loops(edge_index, edge_attr)
+    keep_edge = keep_node[edge_index[0]] & keep_node[edge_index[1]]
+    edge_index = old_to_new_node[edge_index[:, keep_edge]]
+
+    if edge_attr is not None:
+        edge_attr = edge_attr[keep_edge]
+
+    X, node_mask = to_dense_batch(
+        x=x,
+        batch=batch,
+        max_num_nodes=max_nodes,
+    )
+
+    A = to_dense_adj(
+        edge_index=edge_index,
+        batch=batch,
+        edge_attr=edge_attr,
+        max_num_nodes=X.size(1),
+    )
+
+    A = (A > 0).float()
+    A = torch.maximum(A, A.transpose(1, 2))
+
+    return X, A, node_mask
+
 
 @app.command()
 def main(
@@ -178,13 +304,15 @@ def main(
     # ----------------------------------------------
 ):
     data = get_data(output_path)
-    loader = LinkNeighborLoader(
-        data,
-        # Sample 30 neighbors for each node for 2 iterations
-        num_neighbors=4,
-        # Use a batch size of 128 for sampling training nodes
+    loader = construct_dataloader(
+        data=data,
+        num_samples=10_000,
+        num_hops=3,
+        max_nodes=64,
+        min_nodes=2,
         batch_size=32,
-        edge_label_index=data.edge_index,
+        shuffle=True,
+        seed=42,
     )
 
     batch = next(iter(loader))
@@ -193,7 +321,14 @@ def main(
     print(batch.x.shape)
     print(batch.edge_index.shape)
 
-    x, adj, node_mask = batch_to_dense(batch, max_nodes=64, batch_size=1)
+    x, adj, node_mask = to_dense(
+        x=batch.x,
+        edge_index=batch.edge_index,
+        edge_attr=getattr(batch, "edge_attr", None),
+        batch=batch.batch,
+        min_nodes=2,
+        max_nodes=None,
+    )
 
     print("x:", x.shape)
     print("adj:", adj.shape)

@@ -8,18 +8,21 @@ import torch
 import wandb
 
 from src.config import MODELS_DIR, PROCESSED_DATA_DIR, FIGURES_DIR
-from src.dataset import get_data, construct_dataloader, batch_to_dense, DATASET
-from src.modeling.model import GaussianDiffusion, Linear_Denoiser, GAT_Denoiser, sample_timesteps
+from src.dataset import get_data, construct_dataloader, to_dense, DATASET
+from src.modeling.model import GaussianDiffusion, TransformerDenoiser, sample_timesteps
 from src.modeling.utils import (
     log_samples,
-    masked_upper_bce_with_logits,
     masked_upper_mse,
     symmetric_noise_like,
 )
 
-from torch_geometric.loader import LinkNeighborLoader
-
 app = typer.Typer()
+
+def masked_node_mse(pred, target, node_mask=None):
+    if node_mask is not None:
+        pred = pred[node_mask]
+        target = target[node_mask]
+    return torch.nn.functional.mse_loss(pred, target)
 
 @app.command()
 def main(
@@ -27,74 +30,50 @@ def main(
     data_path: Path = PROCESSED_DATA_DIR / DATASET,
     model_path: Path = MODELS_DIR / "model.pt",
     max_epochs: int = 10,
-    batch_size: int = 32,
-    max_nodes: int = 64,
+    batch_size: int = 64,
+    max_nodes: int = 32,
     num_samples: int = 10_000,
     num_hops: int = 2,
-    min_nodes: int = 8,
-    lr: float = 1e-4,
+    min_nodes: int = 3,
+    lr: float = 0.0002,
     dropout: float = 0.1,
-    x0_scale: float = 0.2,
+    x_loss_scale: float = 0.2,
     wandb_project: str = "graph-diffusion",
     wandb_entity: str | None = None,
     wandb_run_name: str = "local_mac_run",
     wandb_mode: str = "disabled",
     wandb_log_interval: int = 10,
-    sample_every: int = 5,
-    sample_graphs: int = 1,
-    sample_threshold: float = 0.2,
-    use_node_mask: bool = False,
+    sample_every: int = 1,
+    sample_graphs: int = 6,
+    sample_threshold: float = 0.5,
+    use_node_mask: bool = True,
     # -----------------------------------------
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data = get_data(data_path)
 
-    train_loader = LinkNeighborLoader(
-        data,
-        num_neighbors=[5],
+    train_loader = construct_dataloader(
+        data=data,
+        num_samples=num_samples,
+        num_hops=num_hops,
+        max_nodes=max_nodes,
+        min_nodes=min_nodes,
         batch_size=batch_size,
-        edge_label_index=data.edge_index,
+        shuffle=True,
     )
-
-    config = {
-        "data_path": str(data_path),
-        "model_path": str(model_path),
-        "device": device,
-        "max_epochs": max_epochs,
-        "batch_size": batch_size,
-        "max_nodes": max_nodes,
-        "num_samples": num_samples,
-        "num_hops": num_hops,
-        "min_nodes": min_nodes,
-        "lr": lr,
-        "x0_loss_lambda": x0_scale,
-        "diffusion_steps": 1000,
-        "encoder_dims": [1024, 512],
-        "latent_dim": 256,
-        "decoder_dims": [1024, 512],
-        "feature_dim": data.num_features,
-        "time_emb_dim": 32,
-        "dropout": dropout,
-        "optimizer": "Adam",
-        "sample_every": sample_every,
-        "sample_graphs": sample_graphs,
-        "sample_threshold": sample_threshold,
-        "use_node_mask": use_node_mask,
-    }
 
     wandb.init(
         project=wandb_project,
         entity=wandb_entity,
         name=wandb_run_name,
         mode=wandb_mode,
-        config=config,
     )
 
     logger.info("Training some model...")
 
-    diffusion = GaussianDiffusion(num_steps=1000).to(device)
-    denoiser = GAT_Denoiser(
-        max_nodes=64,
+    diffusion = GaussianDiffusion(num_steps=500).to(device)
+    denoiser = TransformerDenoiser(
+        max_nodes=max_nodes,
         feature_dim=data.num_features,
         hidden_dim=128,
         time_emb_dim=32,
@@ -103,7 +82,7 @@ def main(
         dropout=dropout,
     ).to(device)
 
-    optimizer = torch.optim.Adam(denoiser.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(denoiser.parameters(), lr=lr, amsgrad=True)
     wandb.watch(denoiser, log="gradients", log_freq=max(1, wandb_log_interval * 10))
     global_step = 0
 
@@ -132,28 +111,19 @@ def main(
         for step, batch in enumerate(batch_bar, start=1):
             batch = batch.to(device)
 
-            x, adj, node_mask = batch_to_dense(batch, max_nodes=None, batch_size=1)
+            x, adj, node_mask = to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch, min_nodes=min_nodes, max_nodes=max_nodes)
             x = x.to(device).float()
             adj = adj.to(device).float()
             node_mask = node_mask.to(device)
-
-            adj = torch.maximum(adj, adj.transpose(1, 2))
 
             if use_node_mask:
                 training_node_mask = node_mask
             else:
                 training_node_mask = None
 
-            plot_node_mask = node_mask if use_node_mask else torch.ones(
-                adj.shape[0],
-                adj.shape[1],
-                dtype=torch.bool,
-                device=device,
-            )
-
             latest_x = x.detach()
             latest_adj = adj.detach()
-            latest_node_mask = plot_node_mask.detach()
+            latest_node_mask = node_mask.detach()
 
             t = sample_timesteps(
                 batch_size=adj.shape[0],
@@ -161,21 +131,29 @@ def main(
                 device=device,
             )
 
-            noise = symmetric_noise_like(adj)
-            adj_noised, noise = diffusion.q_sample(adj, t, noise=noise)
+            x_noise = torch.randn_like(x)
+            adj_noise = symmetric_noise_like(adj)
 
-            pred = denoiser(x, adj_noised, t, training_node_mask)
-            
-            loss_noise = masked_upper_mse(pred, noise, training_node_mask)
+            x_noised, _ = diffusion.q_sample(x, t, noise=x_noise)
+            adj_noised, _ = diffusion.q_sample(adj, t, noise=adj_noise)
 
-            x0_pred = diffusion.predict_x0_from_noise(adj_noised, t, pred)
-            loss_x0 = masked_upper_bce_with_logits(
-                logits=x0_pred,
-                target=adj,
+            pred = denoiser(x_noised, adj_noised, t, training_node_mask)
+            pred_x = pred["X"]
+            pred_adj = pred["E"]
+
+            loss_adj = masked_upper_mse(
+                pred=pred_adj,
+                target=adj_noise,
                 node_mask=training_node_mask,
             )
 
-            loss = loss_noise + x0_scale * loss_x0
+            loss_x = masked_node_mse(
+                pred=pred_x,
+                target=x_noise,
+                node_mask=training_node_mask,
+            )
+
+            loss = loss_adj + x_loss_scale * loss_x
 
             optimizer.zero_grad()
             loss.backward()
@@ -197,13 +175,12 @@ def main(
                     {
                         "train/batch_loss": loss_value,
                         "train/running_loss": running_loss,
-                        "train/noise_loss": loss_noise,
-                        "train/x0_loss": loss_x0,
+                        "train/adj_loss": loss_adj.item(),
+                        "train/x_loss": loss_x.item(),
                         "train/grad_norm": float(grad_norm),
-                        "train/pred_noise_mean": pred.detach().mean().item(),
-                        "train/pred_noise_std": pred.detach().std().item(),
-                        "train/target_noise_mean": noise.detach().mean().item(),
-                        "train/target_noise_std": noise.detach().std().item(),
+                        "train/pred_x_mean": pred_x.detach().mean().item(),
+                        "train/pred_x_std": pred_x.detach().std().item(),
+                        "train/target_x_mean": x.detach().mean().item(),
                         "train/timestep_mean": t.float().mean().item(),
                         "train/epoch": epoch,
                     },

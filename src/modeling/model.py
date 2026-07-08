@@ -7,9 +7,6 @@ import math
 import torch
 from torch import nn
 from torch import Tensor
-import torch.distributions as td
-
-from torch_geometric.nn import GATConv
 
 app = typer.Typer()
 
@@ -140,10 +137,10 @@ class GaussianDiffusion(nn.Module):
         t: Tensor,
         node_mask: Tensor | None = None,
     ):
-        noise_pred = model(x, xt, t, node_mask)
+        model_out = model(x, xt, t, node_mask)
+        noise_pred = model_out["E"] if isinstance(model_out, dict) else model_out
 
         x0_pred = self.predict_x0_from_noise(xt, t, noise_pred)
-        x0_pred = x0_pred.clamp(0.0, 1.0)
 
         if node_mask is not None:
             pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
@@ -260,174 +257,79 @@ class GaussianDiffusion(nn.Module):
             res = res[..., None]
 
         return res.expand(broadcast_shape)
-
     
-class Linear_Denoiser(nn.Module):
-    """
-    Simple MLP denoiser for dense adjacency matrices.
 
-    Input:
-        adj_noisy: [B, N, N]
-        t:         [B]
-
-    Output:
-        pred_noise: [B, N, N]
-    """
-
+class DenseGraphAttentionBlock(nn.Module):
     def __init__(
         self,
-        max_nodes: int = 64,
-        encoder_dims: list[int] | None = None,
-        latent_dim: int = 512,
-        decoder_dims: list[int] | None = None,
-        feature_dim: int = 512,
-        time_emb_dim: int = 16,
+        hidden_dim: int,
+        num_heads: int = 4,
         dropout: float = 0.0,
-        force_symmetric_output: bool = True,
     ):
         super().__init__()
 
-        if encoder_dims is None:
-            encoder_dims = [1024]
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
 
-        if decoder_dims is None:
-            decoder_dims = [1024]
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.scale = self.head_dim ** -0.5
 
-        self.max_nodes = max_nodes
-        self.adj_dim = max_nodes * max_nodes
-        self.time_emb_dim = time_emb_dim
-        self.feature_dim = feature_dim
-        self.latent_dim = latent_dim
-        self.force_symmetric_output = force_symmetric_output
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.edge_bias = nn.Linear(1, num_heads)
 
-        self.time_embedding = SinusoidalTimeEmbedding(time_emb_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.norm_attn = nn.LayerNorm(hidden_dim)
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
 
-        encoder_input_dim = self.adj_dim + latent_dim + time_emb_dim
-        decoder_output_dim = self.adj_dim
-
-        self.encoder = self._build_mlp(
-            dims=[encoder_input_dim, *encoder_dims, latent_dim],
-            dropout=dropout,
-            activate_last=False,
-        )
-
-        self.decoder = self._build_mlp(
-            dims=[latent_dim, *decoder_dims, decoder_output_dim],
-            dropout=dropout,
-            activate_last=False,
-        )
-
-        self.x_encoder = nn.Sequential(
-            nn.Linear(feature_dim, latent_dim),
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
             nn.SiLU(),
-            nn.Linear(latent_dim, latent_dim),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
+            nn.Linear(4 * hidden_dim, hidden_dim),
         )
-
-    @staticmethod
-    def _build_mlp(
-        dims: list[int],
-        dropout: float = 0.0,
-        activate_last: bool = False,
-    ) -> nn.Sequential:
-        layers: list[nn.Module] = []
-
-        for layer_idx, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:])):
-            is_last = layer_idx == len(dims) - 2
-
-            layers.append(nn.Linear(d_in, d_out))
-
-            if activate_last or not is_last:
-                layers.append(nn.SiLU())
-
-                if dropout > 0.0:
-                    layers.append(nn.Dropout(dropout))
-
-        return nn.Sequential(*layers)
-
-    def encode(self, x, adj_noisy: Tensor, t: Tensor, node_mask: Tensor | None = None) -> Tensor:
-        """
-        Encode noisy adjacency and timestep into a latent representation.
-
-        adj_noisy: [B, N, N]
-        t:         [B]
-        node_mask: [B, N], optional
-        returns:   [B, latent_dim]
-        """
-        B, N, _ = adj_noisy.shape
-
-        if N != self.max_nodes:
-            raise ValueError(
-                f"Expected adj_noisy with N={self.max_nodes}, "
-                f"but got N={N}."
-            )
-
-        if node_mask is not None:
-            adj_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
-            adj_noisy = adj_noisy * adj_mask.float()
-
-        adj_flat = adj_noisy.reshape(B, -1)
-        t_emb = self.time_embedding(t)
-        x_graph = masked_mean_pool_x(x, node_mask)
-        x_emb = self.x_encoder(x_graph)
-
-        h = torch.cat([adj_flat, x_emb, t_emb], dim=-1)
-        z = self.encoder(h)
-
-        return z
-
-    def decode(self, z: Tensor, node_mask: Tensor | None = None, sample: bool = False) -> Tensor:
-        """
-        Decode latent representation into predicted adjacency noise.
-
-        z:         [B, latent_dim]
-        node_mask: [B, N], optional
-        returns:   [B, N, N]
-        """
-        B = z.shape[0]
-
-        pred = self.decoder(z)
-        pred = pred.reshape(B, self.max_nodes, self.max_nodes)
-
-        if self.force_symmetric_output:
-            pred = 0.5 * (pred + pred.transpose(1, 2))
-
-        if node_mask is not None:
-            adj_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
-            pred = pred * adj_mask.float()
-
-        return pred
 
     def forward(
         self,
-        x: Tensor,
+        h: Tensor,
         adj_noisy: Tensor,
-        t: Tensor,
         node_mask: Tensor | None = None,
     ) -> Tensor:
-        """
-        adj_noisy: [B, N, N]
-        t:         [B]
-        node_mask: [B, N], optional
-        """
-        z = self.encode(x, adj_noisy, t, node_mask)
-        pred = self.decode(z, node_mask)
+        B, N, H = h.shape
 
-        return pred
-    
-class GAT_Denoiser(nn.Module):
-    """
-    GAT-based epsilon predictor for dense adjacency diffusion.
+        q = self.q_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-    Input:
-        x:         [B, N, F]
-        adj_noisy: [B, N, N]
-        t:         [B]
-        node_mask: [B, N], optional
+        attn_scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        edge_bias = self.edge_bias(adj_noisy.unsqueeze(-1)).permute(0, 3, 1, 2)
+        attn_scores = attn_scores + edge_bias
 
-    Output:
-        pred_noise: [B, N, N]
-    """
+        if node_mask is not None:
+            key_mask = node_mask[:, None, None, :]
+            attn_scores = attn_scores.masked_fill(~key_mask, -1e9)
 
+        attn = torch.softmax(attn_scores, dim=-1)
+        attn = self.dropout(attn)
+
+        h_attn = torch.matmul(attn, v)
+        h_attn = h_attn.transpose(1, 2).contiguous().view(B, N, H)
+        h_attn = self.out_proj(h_attn)
+
+        h = self.norm_attn(h + self.dropout(h_attn))
+        h = self.norm_ffn(h + self.dropout(self.ffn(h)))
+
+        if node_mask is not None:
+            h = h * node_mask.unsqueeze(-1).float()
+
+        return h
+
+
+class TransformerDenoiser(nn.Module):
     def __init__(
         self,
         max_nodes: int = 64,
@@ -438,6 +340,7 @@ class GAT_Denoiser(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.0,
         force_symmetric_output: bool = True,
+        x_out_dim: int | None = None,
     ):
         super().__init__()
 
@@ -452,6 +355,7 @@ class GAT_Denoiser(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.force_symmetric_output = force_symmetric_output
+        self.x_out_dim = feature_dim if x_out_dim is None else x_out_dim
 
         self.time_embedding = SinusoidalTimeEmbedding(time_emb_dim)
 
@@ -461,60 +365,19 @@ class GAT_Denoiser(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        self.gat_layers = nn.ModuleList()
-
-        if num_layers == 1:
-            self.gat_layers.append(
-                GATConv(
-                    in_channels=hidden_dim,
-                    out_channels=hidden_dim,
-                    heads=1,
-                    concat=False,
+        self.attn_layers = nn.ModuleList(
+            [
+                DenseGraphAttentionBlock(
+                    hidden_dim=hidden_dim,
+                    num_heads=num_heads,
                     dropout=dropout,
-                    edge_dim=1,
-                    add_self_loops=False,
                 )
-            )
-        else:
-            self.gat_layers.append(
-                GATConv(
-                    in_channels=hidden_dim,
-                    out_channels=hidden_dim,
-                    heads=num_heads,
-                    concat=True,
-                    dropout=dropout,
-                    edge_dim=1,
-                    add_self_loops=False,
-                )
-            )
-
-            for _ in range(num_layers - 2):
-                self.gat_layers.append(
-                    GATConv(
-                        in_channels=hidden_dim * num_heads,
-                        out_channels=hidden_dim,
-                        heads=num_heads,
-                        concat=True,
-                        dropout=dropout,
-                        edge_dim=1,
-                        add_self_loops=False,
-                    )
-                )
-
-            self.gat_layers.append(
-                GATConv(
-                    in_channels=hidden_dim * num_heads,
-                    out_channels=hidden_dim,
-                    heads=1,
-                    concat=False,
-                    dropout=dropout,
-                    edge_dim=1,
-                    add_self_loops=False,
-                )
-            )
+                for _ in range(num_layers)
+            ]
+        )
 
         edge_input_dim = 3 * hidden_dim + time_emb_dim + 1
-        self.edge_mlp = nn.Sequential(
+        self.out_E = nn.Sequential(
             nn.Linear(edge_input_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
@@ -523,46 +386,14 @@ class GAT_Denoiser(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def _complete_edge_index_and_attr(
-        self,
-        adj_noisy: Tensor,
-        node_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        Build a batched complete directed edge index over valid non-diagonal nodes.
-        """
-        B, N, _ = adj_noisy.shape
-        device = adj_noisy.device
-
-        node_ids = torch.arange(N, device=device)
-        src_local, dst_local = torch.meshgrid(node_ids, node_ids, indexing="ij")
-
-        pair_mask = src_local != dst_local
-
-        if node_mask is None:
-            node_mask = torch.ones(B, N, dtype=torch.bool, device=device)
-
-        edge_indices = []
-        edge_attrs = []
-
-        for b in range(B):
-            valid_nodes = node_mask[b]
-            valid_pair_mask = pair_mask & valid_nodes[src_local] & valid_nodes[dst_local]
-
-            src = src_local[valid_pair_mask] + b * N
-            dst = dst_local[valid_pair_mask] + b * N
-
-            edge_indices.append(torch.stack([src, dst], dim=0))
-            edge_attrs.append(adj_noisy[b, src_local[valid_pair_mask], dst_local[valid_pair_mask]].unsqueeze(-1))
-
-        if len(edge_indices) == 0:
-            edge_index = torch.empty(2, 0, dtype=torch.long, device=device)
-            edge_attr = torch.empty(0, 1, dtype=adj_noisy.dtype, device=device)
-        else:
-            edge_index = torch.cat(edge_indices, dim=1)
-            edge_attr = torch.cat(edge_attrs, dim=0)
-
-        return edge_index, edge_attr
+        self.out_X = nn.Sequential(
+            nn.Linear(hidden_dim + time_emb_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.x_out_dim),
+        )
 
     def encode_nodes(
         self,
@@ -571,12 +402,7 @@ class GAT_Denoiser(nn.Module):
         t: Tensor,
         node_mask: Tensor | None = None,
     ) -> Tensor:
-        B, N, F = x.shape
-
-        # if N != self.max_nodes:
-        #     raise ValueError(
-        #         f"Expected x and adj_noisy with N={self.max_nodes}, but got N={N}."
-        #     )
+        B, N, _ = x.shape
 
         t_emb = self.time_embedding(t)
         t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
@@ -587,21 +413,16 @@ class GAT_Denoiser(nn.Module):
         if node_mask is not None:
             h = h * node_mask.unsqueeze(-1).float()
 
-        h_flat = h.reshape(B * N, self.hidden_dim)
-        edge_index, edge_attr = self._complete_edge_index_and_attr(adj_noisy, node_mask)
-
-        for gat_layer in self.gat_layers:
-            h_flat = gat_layer(h_flat, edge_index, edge_attr=edge_attr)
-            h_flat = torch.nn.functional.silu(h_flat)
-
-        h = h_flat.reshape(B, N, self.hidden_dim)
-
-        if node_mask is not None:
-            h = h * node_mask.unsqueeze(-1).float()
+        for attn_layer in self.attn_layers:
+            h = attn_layer(
+                h=h,
+                adj_noisy=adj_noisy,
+                node_mask=node_mask,
+            )
 
         return h
 
-    def decode_edges(
+    def decode_E(
         self,
         h: Tensor,
         adj_noisy: Tensor,
@@ -616,27 +437,41 @@ class GAT_Denoiser(nn.Module):
 
         t_emb = self.time_embedding(t)
         t_pair = t_emb[:, None, None, :].expand(B, N, N, self.time_emb_dim)
-
         adj_pair = adj_noisy.unsqueeze(-1)
 
-        edge_input = torch.cat(
-            [h_i, h_j, h_pair, t_pair, adj_pair],
-            dim=-1,
-        )
-
-        pred = self.edge_mlp(edge_input).squeeze(-1)
+        edge_input = torch.cat([h_i, h_j, h_pair, t_pair, adj_pair], dim=-1)
+        out_E = self.out_E(edge_input).squeeze(-1)
 
         if self.force_symmetric_output:
-            pred = 0.5 * (pred + pred.transpose(1, 2))
+            out_E = 0.5 * (out_E + out_E.transpose(1, 2))
 
         if node_mask is not None:
-            adj_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
-            pred = pred * adj_mask.float()
+            pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
+            out_E = out_E * pair_mask.float()
 
-        eye = torch.eye(N, device=pred.device).unsqueeze(0)
-        pred = pred * (1.0 - eye)
+        eye = torch.eye(N, device=out_E.device).unsqueeze(0)
+        out_E = out_E * (1.0 - eye)
 
-        return pred
+        return out_E
+
+    def decode_X(
+        self,
+        h: Tensor,
+        t: Tensor,
+        node_mask: Tensor | None = None,
+    ) -> Tensor:
+        B, N, _ = h.shape
+
+        t_emb = self.time_embedding(t)
+        t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
+
+        x_input = torch.cat([h, t_node], dim=-1)
+        out_X = self.out_X(x_input)
+
+        if node_mask is not None:
+            out_X = out_X * node_mask.unsqueeze(-1).float()
+
+        return out_X
 
     def forward(
         self,
@@ -644,20 +479,31 @@ class GAT_Denoiser(nn.Module):
         adj_noisy: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
-    ) -> Tensor:
+    ) -> dict[str, Tensor]:
         h = self.encode_nodes(
             x=x,
             adj_noisy=adj_noisy,
             t=t,
             node_mask=node_mask,
         )
-        pred = self.decode_edges(
+
+        out_E = self.decode_E(
             h=h,
             adj_noisy=adj_noisy,
             t=t,
             node_mask=node_mask,
         )
-        return pred
+
+        out_X = self.decode_X(
+            h=h,
+            t=t,
+            node_mask=node_mask,
+        )
+
+        return {
+            "X": out_X,
+            "E": out_E,
+        }
 
 @app.command()
 def main():
@@ -687,17 +533,18 @@ def main():
 
     adj_noised, noise = diffusion.q_sample(x0=adj, t=t)
 
-    model = GAT_Denoiser(
+    model = TransformerDenoiser(
         max_nodes=64,
         feature_dim=1433,
         hidden_dim=128,
         time_emb_dim=32,
         num_layers=2,
         num_heads=4,
-        dropout=0.0,
+        dropout=0.2,
     ).to(device)
 
-    pred_noise = model(x_feat, adj_noised, t)
+    pred = model(x_feat, adj_noised, t)
+    pred_noise = pred["E"]
     x0_pred = diffusion.predict_x0_from_noise(adj_noised, t, pred_noise)
 
     logger.debug(f"Adjacency Matrix: \n {adj[0, :3, :3]}")
@@ -710,19 +557,13 @@ def main():
         model=model,
         x=x_feat[:1],
         adj_shape=(1, N, N),
-        # node_mask=node_mask[:1],
+        node_mask=node_mask[:1],
         device=device,
     )
 
     sampled = 0.5 * (sampled + sampled.transpose(1, 2))
 
     logger.debug(f"Sampled Adjacency Matrix: \n {sampled.detach()[0, :3, :3]}")
-
-    m = nn.Sigmoid()
-    bce_loss = nn.BCEWithLogitsLoss()
-    loss = bce_loss(x0_pred, adj)
-    logger.debug(f"BCE Loss: {loss.detach():2.3f}")
-
     logger.success("Model construction complete.")
     # -----------------------------------------
 
