@@ -11,7 +11,7 @@ from torch_geometric.utils import to_networkx
 import typer
 
 from src.config import FIGURES_DIR, PROCESSED_DATA_DIR
-from src.dataset import get_data, to_dense, construct_dataloader, DATASET
+from src.dataset_discreet import get_data, to_dense, construct_dataloader, DATASET
 
 app = typer.Typer()
 

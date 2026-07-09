@@ -87,7 +87,6 @@ def get_data(path: Path):
     transform = T.Compose([
         T.RandomNodeSplit(num_val=500, num_test=500),
         T.RemoveIsolatedNodes(),
-        T.NormalizeFeatures(),
     ])
 
     dataset = Planetoid(
@@ -98,6 +97,8 @@ def get_data(path: Path):
     )
 
     data = dataset[0]
+    data.num_node_classes = dataset.num_classes
+    data.num_edge_classes = 2
 
     print(f"Raw data statistics for: {DATASET}")
     print("-"*25)
@@ -106,6 +107,9 @@ def get_data(path: Path):
     print("num_edges:", data.num_edges)
     print("num_features:", data.num_features)
     print("num_classes:", dataset.num_classes)
+    print("discrete node feature:", data.y)
+    print("num_node_classes:", data.num_node_classes)
+    print("num_edge_classes:", data.num_edge_classes)
 
     return data
 
@@ -119,23 +123,23 @@ def extract_k_hop(data, root_node, num_hops=2, max_nodes: int = 64, min_nodes: i
         num_nodes=data.num_nodes,
     )
 
-    # if subset.numel() > max_nodes:
-    #     keep_local = connected_node_subset(
-    #         edge_index=edge_index,
-    #         center_local=int(mapping.item()),
-    #         num_nodes=subset.numel(),
-    #         max_nodes=max_nodes,
-    #     )
-    #     subset = subset[keep_local]
+    if subset.numel() > max_nodes:
+        keep_local = connected_node_subset(
+            edge_index=edge_index,
+            center_local=int(mapping.item()),
+            num_nodes=subset.numel(),
+            max_nodes=max_nodes,
+        )
+        subset = subset[keep_local]
 
-    #     edge_index, edge_mask = subgraph(
-    #         subset=subset,
-    #         edge_index=data.edge_index,
-    #         relabel_nodes=True,
-    #         num_nodes=data.num_nodes,
-    #     )
-    # else:
-    #     edge_attr_mask = edge_mask
+        edge_index, edge_mask = subgraph(
+            subset=subset,
+            edge_index=data.edge_index,
+            relabel_nodes=True,
+            num_nodes=data.num_nodes,
+        )
+    else:
+        edge_attr_mask = edge_mask
 
     if subset.numel() < min_nodes:
         return None
@@ -157,10 +161,12 @@ def extract_k_hop(data, root_node, num_hops=2, max_nodes: int = 64, min_nodes: i
             num_nodes=data.num_nodes,
         )
 
+    node_labels = data.y[subset].long()
+
     sub_data = Data(
-        x=data.x[subset],
+        x=node_labels,
         edge_index=edge_index,
-        y=data.y[subset],
+        y=node_labels,
         original_node_ids=subset,
         num_nodes=subset.numel(),
     )
@@ -282,6 +288,7 @@ def to_dense(
         batch=batch,
         max_num_nodes=max_nodes,
     )
+    X = X.long()
 
     A = to_dense_adj(
         edge_index=edge_index,
@@ -290,7 +297,7 @@ def to_dense(
         max_num_nodes=X.size(1),
     )
 
-    A = (A > 0).float()
+    A = (A > 0).long()
     A = torch.maximum(A, A.transpose(1, 2))
 
     return X, A, node_mask
@@ -333,6 +340,10 @@ def main(
     print("x:", x.shape)
     print("adj:", adj.shape)
     print("mask:", node_mask.shape)
+    print("x dtype:", x.dtype)
+    print("adj dtype:", adj.dtype)
+    print("unique node classes in batch:", torch.unique(x[node_mask]).tolist())
+    print("unique edge classes in batch:", torch.unique(adj).tolist())
 
     num_batches = 0
     for i, _ in enumerate(loader):

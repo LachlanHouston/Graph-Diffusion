@@ -16,6 +16,7 @@ classifiers = [
     
 ]
 dependencies = [
+    "imageio>=2.37.3",
     "loguru",
     "matplotlib>=3.10.8",
     "mkdocs",
