@@ -230,6 +230,55 @@ def construct_dataloader(
     )
 
 
+def estimate_class_distributions(
+    data,
+    loader,
+    max_nodes: int | None = None,
+    min_nodes: int = 1,
+):
+    node_counts = torch.zeros(data.num_node_classes, dtype=torch.long)
+    edge_counts = torch.zeros(data.num_edge_classes, dtype=torch.long)
+
+    for batch in loader:
+        x, adj, node_mask = to_dense(
+            x=batch.x,
+            edge_index=batch.edge_index,
+            edge_attr=getattr(batch, "edge_attr", None),
+            batch=batch.batch,
+            min_nodes=min_nodes,
+            max_nodes=max_nodes,
+        )
+
+        valid_x = x[node_mask]
+        node_counts += torch.bincount(
+            valid_x.long(),
+            minlength=data.num_node_classes,
+        ).cpu()
+
+        _, num_nodes, _ = adj.shape
+        valid_pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
+        upper_mask = torch.triu(
+            torch.ones(num_nodes, num_nodes, dtype=torch.bool, device=adj.device),
+            diagonal=1,
+        )
+        edge_values = adj[valid_pair_mask & upper_mask.unsqueeze(0)]
+
+        edge_counts += torch.bincount(
+            edge_values.long(),
+            minlength=data.num_edge_classes,
+        ).cpu()
+
+    node_probs = node_counts.float() / node_counts.sum().clamp_min(1)
+    edge_probs = edge_counts.float() / edge_counts.sum().clamp_min(1)
+
+    return {
+        "node_counts": node_counts,
+        "edge_counts": edge_counts,
+        "node_probs": node_probs,
+        "edge_probs": edge_probs,
+    }
+
+
 def to_dense(
     x,
     edge_index,
@@ -348,7 +397,19 @@ def main(
     num_batches = 0
     for i, _ in enumerate(loader):
         num_batches += 1
-    print(num_batches)
+    print(f"Number of batches per epoch: {num_batches}")
+
+    distributions = estimate_class_distributions(
+        data=data,
+        loader=loader,
+        max_nodes=64,
+        min_nodes=2,
+    )
+
+    print("node class counts:", distributions["node_counts"].tolist())
+    print("node class probs:", distributions["node_probs"].tolist())
+    print("edge class counts [no-edge, edge]:", distributions["edge_counts"].tolist())
+    print("edge class probs [no-edge, edge]:", distributions["edge_probs"].tolist())
 
     print("Done Testing!")
 

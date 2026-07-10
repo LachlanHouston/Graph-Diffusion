@@ -97,8 +97,8 @@ class DiscreteDiffusion(nn.Module):
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
-        self.register_buffer("u_x", torch.ones(1, x_classes, x_classes) / x_classes)
-        self.register_buffer("u_e", torch.ones(1, e_classes, e_classes) / e_classes)
+        self.register_buffer("u_x", torch.tensor([0.05, 0.15, 0.35, 0.1, 0.25, 0.1])) # [0.04381483793258667, 0.13444337248802185, 0.3537616729736328, 0.12903843820095062, 0.24303025007247925, 0.0959114283323288]
+        self.register_buffer("u_e", torch.tensor([0.9, 0.1])) # [0.9278163909912109, 0.07218358665704727]
         self.register_buffer("eye_x", torch.eye(x_classes).unsqueeze(0))
         self.register_buffer("eye_e", torch.eye(e_classes).unsqueeze(0))
 
@@ -123,6 +123,149 @@ class DiscreteDiffusion(nn.Module):
             "X": q_x,
             "E": q_e,
         }
+
+    def get_Qt_bar_prev(self, t: Tensor):
+        alpha_bar_prev_t = torch.ones_like(self.alpha_bars[t])
+        nonzero_t = t > 0
+        alpha_bar_prev_t[nonzero_t] = self.alpha_bars[t[nonzero_t] - 1]
+        alpha_bar_prev_t = alpha_bar_prev_t.view(-1, 1, 1)
+
+        q_x = alpha_bar_prev_t * self.eye_x + (1.0 - alpha_bar_prev_t) * self.u_x
+        q_e = alpha_bar_prev_t * self.eye_e + (1.0 - alpha_bar_prev_t) * self.u_e
+
+        return {
+            "X": q_x,
+            "E": q_e,
+        }
+
+    def posterior_node_probs(self, pred_x0_probs: Tensor, x_t: Tensor, t: Tensor):
+        """
+        Approximate p_theta(x_{t-1} | x_t) by marginalising over predicted x_0.
+
+        For each possible clean class x_0 and previous class x_{t-1}, use:
+
+            q(x_{t-1} | x_t, x_0)
+            ∝ q(x_t | x_{t-1}) q(x_{t-1} | x_0) / q(x_t | x_0)
+
+        then weight by p_theta(x_0 | x_t).
+        """
+        B, N, K = pred_x0_probs.shape
+
+        q_t = self.get_Qt(t)["X"]                       # [B, K, K], from x_{t-1} to x_t
+        q_bar_t = self.get_Qt_bar(t)["X"]               # [B, K, K], from x_0 to x_t
+        q_bar_prev = self.get_Qt_bar_prev(t)["X"]       # [B, K, K], from x_0 to x_{t-1}
+
+        # q(x_t=current | x_{t-1}=k) for all candidate previous classes k.
+        q_t_given_prev = q_t[:, None, :, :].expand(B, N, K, K)
+        current_x_for_prev = x_t[:, :, None, None].expand(B, N, K, 1)
+        q_current_given_prev = q_t_given_prev.gather(
+            dim=-1,
+            index=current_x_for_prev,
+        ).squeeze(-1)                                    # [B, N, K]
+
+        # q(x_t=current | x_0=c) for all candidate clean classes c.
+        q_bar_t_expanded = q_bar_t[:, None, :, :].expand(B, N, K, K)
+        current_x_for_x0 = x_t[:, :, None, None].expand(B, N, K, 1)
+        q_current_given_x0 = q_bar_t_expanded.gather(
+            dim=-1,
+            index=current_x_for_x0,
+        ).squeeze(-1).clamp_min(1e-12)                   # [B, N, K]
+
+        # q(x_{t-1}=k | x_0=c) for all clean classes c and previous classes k.
+        q_prev_given_x0 = q_bar_prev[:, None, :, :].expand(B, N, K, K)
+
+        # Sum over possible clean classes c:
+        # p_theta(c | x_t) * q(x_{t-1}=k | c) * q(x_t | k) / q(x_t | c)
+        weights_x0 = pred_x0_probs / q_current_given_x0
+        posterior = torch.einsum(
+            "bnc,bnck,bnk->bnk",
+            weights_x0,
+            q_prev_given_x0,
+            q_current_given_prev,
+        )
+
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return posterior
+
+    def posterior_edge_probs(self, pred_e0_probs: Tensor, e_t: Tensor, t: Tensor):
+        """
+        Approximate p_theta(e_{t-1} | e_t) by marginalising over predicted e_0.
+
+        This is the edge analogue of posterior_node_probs.
+        """
+        B, N, _, K = pred_e0_probs.shape
+
+        q_t = self.get_Qt(t)["E"]                       # [B, K, K], from e_{t-1} to e_t
+        q_bar_t = self.get_Qt_bar(t)["E"]               # [B, K, K], from e_0 to e_t
+        q_bar_prev = self.get_Qt_bar_prev(t)["E"]       # [B, K, K], from e_0 to e_{t-1}
+
+        # q(e_t=current | e_{t-1}=k) for all candidate previous edge classes k.
+        q_t_given_prev = q_t[:, None, None, :, :].expand(B, N, N, K, K)
+        current_e_for_prev = e_t[:, :, :, None, None].expand(B, N, N, K, 1)
+        q_current_given_prev = q_t_given_prev.gather(
+            dim=-1,
+            index=current_e_for_prev,
+        ).squeeze(-1)                                    # [B, N, N, K]
+
+        # q(e_t=current | e_0=c) for all candidate clean edge classes c.
+        q_bar_t_expanded = q_bar_t[:, None, None, :, :].expand(B, N, N, K, K)
+        current_e_for_e0 = e_t[:, :, :, None, None].expand(B, N, N, K, 1)
+        q_current_given_e0 = q_bar_t_expanded.gather(
+            dim=-1,
+            index=current_e_for_e0,
+        ).squeeze(-1).clamp_min(1e-12)                   # [B, N, N, K]
+
+        # q(e_{t-1}=k | e_0=c) for all clean classes c and previous classes k.
+        q_prev_given_e0 = q_bar_prev[:, None, None, :, :].expand(B, N, N, K, K)
+
+        # Sum over possible clean classes c:
+        # p_theta(c | e_t) * q(e_{t-1}=k | c) * q(e_t | k) / q(e_t | c)
+        weights_e0 = pred_e0_probs / q_current_given_e0
+        posterior = torch.einsum(
+            "bnmc,bnmck,bnmk->bnmk",
+            weights_e0,
+            q_prev_given_e0,
+            q_current_given_prev,
+        )
+
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return posterior
+
+    def p_sample_step(
+        self,
+        model: nn.Module,
+        x_t: Tensor,
+        e_t: Tensor,
+        t: Tensor,
+        node_mask: Tensor | None = None,
+    ):
+        logits = model(x_t, e_t, t, node_mask)
+
+        pred_x0_probs = torch.softmax(logits["X"], dim=-1)
+        pred_e0_probs = torch.softmax(logits["E"], dim=-1)
+
+        if torch.all(t == 0):
+            x_prev_probs = pred_x0_probs
+            e_prev_probs = pred_e0_probs
+        else:
+            x_prev_probs = self.posterior_node_probs(
+                pred_x0_probs=pred_x0_probs,
+                x_t=x_t,
+                t=t,
+            )
+            e_prev_probs = self.posterior_edge_probs(
+                pred_e0_probs=pred_e0_probs,
+                e_t=e_t,
+                t=t,
+            )
+
+        x_prev = self.sample_categorical(x_prev_probs)
+        e_prev = self.sample_categorical(e_prev_probs)
+
+        x_prev = self.clean_node_classes(x_prev, node_mask)
+        e_prev = self.clean_edge_classes(e_prev, node_mask)
+
+        return x_prev, e_prev
 
     def sample_categorical(self, probs: Tensor):
         original_shape = probs.shape[:-1]
@@ -201,19 +344,8 @@ class DiscreteDiffusion(nn.Module):
         if device is None:
             device = self.betas.device
 
-        x_probs = torch.ones(
-            batch_size,
-            num_nodes,
-            self.x_classes,
-            device=device,
-        ) / self.x_classes
-        e_probs = torch.ones(
-            batch_size,
-            num_nodes,
-            num_nodes,
-            self.e_classes,
-            device=device,
-        ) / self.e_classes
+        x_probs = self.u_x.view(1, 1, self.x_classes).expand(batch_size, num_nodes, self.x_classes)
+        e_probs = self.u_e.view(1, 1, 1, self.e_classes).expand(batch_size, num_nodes, num_nodes, self.e_classes)
 
         x_t = self.sample_categorical(x_probs)
         e_t = self.sample_categorical(e_probs)
@@ -283,19 +415,17 @@ class DiscreteDiffusion(nn.Module):
                 dtype=torch.long,
             )
 
-            logits = model(x_t, e_t, t, node_mask)
-            x_probs = torch.softmax(logits["X"], dim=-1)
-            e_probs = torch.softmax(logits["E"], dim=-1)
-
-            x_t = self.sample_categorical(x_probs)
-            e_t = self.sample_categorical(e_probs)
-
-            x_t = self.clean_node_classes(x_t, node_mask)
-            e_t = self.clean_edge_classes(e_t, node_mask)
+            x_t, e_t = self.p_sample_step(
+                model=model,
+                x_t=x_t,
+                e_t=e_t,
+                t=t,
+                node_mask=node_mask,
+            )
 
             if keep_chain:
-                x_chain[i] = x_t[: x_chain.size(1)]
-                e_chain[i] = e_t[: e_chain.size(1)]
+                x_chain[self.num_steps - i - 1] = x_t[: x_chain.size(1)]
+                e_chain[self.num_steps - i - 1] = e_t[: e_chain.size(1)]
 
         if keep_chain:
             return {

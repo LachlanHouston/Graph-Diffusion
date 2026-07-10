@@ -19,7 +19,7 @@ app = typer.Typer()
 def main(
     data_path: Path = PROCESSED_DATA_DIR / DATASET,
     model_path: Path = MODELS_DIR / "model_discrete.pt",
-    max_epochs: int = 10,
+    max_epochs: int = 5,
     batch_size: int = 64,
     max_nodes: int = 64,
     num_samples: int = 10_000,
@@ -27,11 +27,11 @@ def main(
     min_nodes: int = 3,
     lr: float = 0.0002,
     dropout: float = 0.1,
-    x_loss_scale: float = 0.2,
+    x_loss_scale: float = 4.0,
     wandb_project: str = "graph-diffusion",
     wandb_entity: str | None = None,
     wandb_run_name: str = "local_discrete_run",
-    wandb_mode: str = "online",
+    wandb_mode: str = "disabled",
     wandb_log_interval: int = 10,
     sample_every: int = 1,
     sample_graphs: int = 6,
@@ -68,7 +68,7 @@ def main(
     diffusion = DiscreteDiffusion(
         x_classes=x_classes,
         e_classes=e_classes,
-        num_steps=500,
+        num_steps=1000,
     ).to(device)
 
     denoiser = TransformerDenoiser(
@@ -164,7 +164,6 @@ def main(
 
             optimizer.zero_grad()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
             optimizer.step()
 
             loss_value = loss.item()
@@ -237,7 +236,7 @@ def main(
                     chain=chain,
                     node_mask=node_mask,
                     gif_path=FIGURES_DIR / "sampling_chain.gif",
-                    duration=10,
+                    duration=60,
                     wandb_mode=wandb_mode,
                     global_step=global_step,
                 )

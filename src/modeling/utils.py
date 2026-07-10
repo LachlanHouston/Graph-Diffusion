@@ -454,9 +454,7 @@ def visualize_chain(
 
         graph = nx.from_numpy_array(e_frame.int().numpy())
         graph.remove_edges_from(nx.selfloop_edges(graph))
-
-        if graph_pos is None:
-            graph_pos = nx.spring_layout(graph, seed=42)
+        graph_pos = nx.spring_layout(graph, seed=42)
 
         node_colors = node_colours_from_features(x_frame, graph.number_of_nodes(), cmap)
 
