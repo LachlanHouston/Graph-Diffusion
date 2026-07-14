@@ -43,12 +43,6 @@ def cosine_beta_schedule(num_steps: int, s: float = 0.008, max_beta: float = 0.9
 
     return betas
 
-def masked_mean_pool_x(x_dense, node_mask):
-    mask = node_mask.unsqueeze(-1).float()
-    x_sum = (x_dense * mask).sum(dim=1)
-    denom = mask.sum(dim=1).clamp(min=1.0)
-    return x_sum / denom
-
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -86,21 +80,64 @@ class DiscreteDiffusion(nn.Module):
     ):
         super().__init__()
 
+        self.beta_start = beta_start
+        self.beta_end = beta_end
         self.x_classes = x_classes
         self.e_classes = e_classes
         self.num_steps = num_steps
 
-        betas = cosine_beta_schedule(num_steps)
+        betas = linear_beta_schedule(num_steps=self.num_steps, beta_start=self.beta_start, beta_end=self.beta_end)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
 
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
-        self.register_buffer("u_x", torch.tensor([0.05, 0.15, 0.35, 0.1, 0.25, 0.1])) # [0.04381483793258667, 0.13444337248802185, 0.3537616729736328, 0.12903843820095062, 0.24303025007247925, 0.0959114283323288]
-        self.register_buffer("u_e", torch.tensor([0.9, 0.1])) # [0.9278163909912109, 0.07218358665704727]
+        self.register_buffer(
+            "u_x",
+            torch.full((x_classes,), 1.0 / x_classes),
+        )
+        self.register_buffer(
+            "u_e",
+            torch.full((e_classes,), 1.0 / e_classes),
+        )
+
         self.register_buffer("eye_x", torch.eye(x_classes).unsqueeze(0))
         self.register_buffer("eye_e", torch.eye(e_classes).unsqueeze(0))
+
+    def _normalize_node_mask(
+        self,
+        node_mask: Tensor | None,
+        device: torch.device,
+    ) -> Tensor | None:
+        if node_mask is None:
+            return None
+        return node_mask.to(device=device, dtype=torch.bool)
+
+    def sample_symmetric_edge_classes(self, probs: Tensor) -> Tensor:
+        """
+        Sample one categorical value per undirected node pair and mirror it.
+
+        probs: [B, N, N, K]
+        returns: [B, N, N]
+        """
+        B, N, _, K = probs.shape
+
+        probs = 0.5 * (probs + probs.transpose(1, 2))
+
+        upper_i, upper_j = torch.triu_indices(
+            N,
+            N,
+            offset=1,
+            device=probs.device,
+        )
+        upper_probs = probs[:, upper_i, upper_j, :]  # [B, P, K]
+        upper_samples = self.sample_categorical(upper_probs)  # [B, P]
+
+        e = torch.zeros(B, N, N, dtype=torch.long, device=probs.device)
+        e[:, upper_i, upper_j] = upper_samples
+        e[:, upper_j, upper_i] = upper_samples
+        return e
 
     def get_Qt(self, t: Tensor):
         beta_t = self.betas[t].view(-1, 1, 1)
@@ -235,32 +272,57 @@ class DiscreteDiffusion(nn.Module):
         self,
         model: nn.Module,
         x_t: Tensor,
+        node_features: Tensor,
         e_t: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
     ):
-        logits = model(x_t, e_t, t, node_mask)
+        node_mask = self._normalize_node_mask(node_mask, x_t.device)
+        node_features = node_features.to(device=x_t.device, dtype=torch.float)
+
+        logits = model(
+            x=x_t,
+            node_features=node_features,
+            adj_noisy=e_t,
+            t=t,
+            node_mask=node_mask,
+        )
+
+        edge_logits = logits["E"]
+        edge_logits = 0.5 * (
+            edge_logits + edge_logits.transpose(1, 2)
+        )
 
         pred_x0_probs = torch.softmax(logits["X"], dim=-1)
-        pred_e0_probs = torch.softmax(logits["E"], dim=-1)
+        pred_e0_probs = torch.softmax(edge_logits, dim=-1)
 
-        if torch.all(t == 0):
-            x_prev_probs = pred_x0_probs
-            e_prev_probs = pred_e0_probs
-        else:
-            x_prev_probs = self.posterior_node_probs(
-                pred_x0_probs=pred_x0_probs,
-                x_t=x_t,
-                t=t,
-            )
-            e_prev_probs = self.posterior_edge_probs(
-                pred_e0_probs=pred_e0_probs,
-                e_t=e_t,
-                t=t,
-            )
+        x_prev_probs = self.posterior_node_probs(
+            pred_x0_probs=pred_x0_probs,
+            x_t=x_t,
+            t=t,
+        )
+        e_prev_probs = self.posterior_edge_probs(
+            pred_e0_probs=pred_e0_probs,
+            e_t=e_t,
+            t=t,
+        )
+
+        zero_mask_x = (t == 0).view(-1, 1, 1)
+        zero_mask_e = (t == 0).view(-1, 1, 1, 1)
+
+        x_prev_probs = torch.where(
+            zero_mask_x,
+            pred_x0_probs,
+            x_prev_probs,
+        )
+        e_prev_probs = torch.where(
+            zero_mask_e,
+            pred_e0_probs,
+            e_prev_probs,
+        )
 
         x_prev = self.sample_categorical(x_prev_probs)
-        e_prev = self.sample_categorical(e_prev_probs)
+        e_prev = self.sample_symmetric_edge_classes(e_prev_probs)
 
         x_prev = self.clean_node_classes(x_prev, node_mask)
         e_prev = self.clean_edge_classes(e_prev, node_mask)
@@ -278,15 +340,17 @@ class DiscreteDiffusion(nn.Module):
         return samples.reshape(original_shape)
 
     def clean_node_classes(self, x: Tensor, node_mask: Tensor | None = None):
+        node_mask = self._normalize_node_mask(node_mask, x.device)
         if node_mask is not None:
             x = x.masked_fill(~node_mask, 0)
         return x.long()
 
     def clean_edge_classes(self, e: Tensor, node_mask: Tensor | None = None):
         B, N, _ = e.shape
+        node_mask = self._normalize_node_mask(node_mask, e.device)
 
-        e = torch.triu(e.long(), diagonal=1)
-        e = e + e.transpose(1, 2)
+        upper = torch.triu(e.long(), diagonal=1)
+        e = upper + upper.transpose(1, 2)
 
         if node_mask is not None:
             pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
@@ -304,6 +368,8 @@ class DiscreteDiffusion(nn.Module):
         t: Tensor,
         node_mask: Tensor | None = None,
     ):
+        node_mask = self._normalize_node_mask(node_mask, torch.device(x0.device))
+
         x0 = self.clean_node_classes(x0, node_mask)
         e0 = self.clean_edge_classes(e0, node_mask)
 
@@ -313,6 +379,7 @@ class DiscreteDiffusion(nn.Module):
             x0,
             num_classes=self.x_classes,
         ).float()
+
         e0_onehot = torch.nn.functional.one_hot(
             e0,
             num_classes=self.e_classes,
@@ -322,7 +389,7 @@ class DiscreteDiffusion(nn.Module):
         prob_E = torch.einsum("bnmc,bcd->bnmd", e0_onehot, q_bar["E"])
 
         x_t = self.sample_categorical(prob_X)
-        e_t = self.sample_categorical(prob_E)
+        e_t = self.sample_symmetric_edge_classes(prob_E)
 
         x_t = self.clean_node_classes(x_t, node_mask)
         e_t = self.clean_edge_classes(e_t, node_mask)
@@ -344,14 +411,22 @@ class DiscreteDiffusion(nn.Module):
         if device is None:
             device = self.betas.device
 
-        x_probs = self.u_x.view(1, 1, self.x_classes).expand(batch_size, num_nodes, self.x_classes)
-        e_probs = self.u_e.view(1, 1, 1, self.e_classes).expand(batch_size, num_nodes, num_nodes, self.e_classes)
+        x_probs = self.u_x.to(device).view(
+            1, 1, self.x_classes
+        ).expand(
+            batch_size, num_nodes, self.x_classes
+        )
+
+        e_probs = self.u_e.to(device).view(
+            1, 1, 1, self.e_classes
+        ).expand(
+            batch_size, num_nodes, num_nodes, self.e_classes
+        )
+
+        node_mask = self._normalize_node_mask(node_mask, torch.device(device))
 
         x_t = self.sample_categorical(x_probs)
-        e_t = self.sample_categorical(e_probs)
-
-        if node_mask is not None:
-            node_mask = node_mask.to(device)
+        e_t = self.sample_symmetric_edge_classes(e_probs)
 
         x_t = self.clean_node_classes(x_t, node_mask)
         e_t = self.clean_edge_classes(e_t, node_mask)
@@ -365,6 +440,7 @@ class DiscreteDiffusion(nn.Module):
     def sample(
         self,
         model: nn.Module,
+        node_features: Tensor,
         batch_size: int,
         num_nodes: int,
         keep_chain: bool = False,
@@ -374,6 +450,26 @@ class DiscreteDiffusion(nn.Module):
     ):
         if device is None:
             device = next(model.parameters()).device
+
+        device = torch.device(device)
+        node_mask = self._normalize_node_mask(node_mask, device)
+        node_features = node_features.to(device=device, dtype=torch.float)
+
+        expected_shape = (batch_size, num_nodes)
+        if node_features.shape[:2] != expected_shape:
+            raise ValueError(
+                "node_features must have shape "
+                f"[batch_size, num_nodes, feature_dim], got {tuple(node_features.shape)} "
+                f"for batch_size={batch_size} and num_nodes={num_nodes}."
+            )
+
+        if node_mask is not None and node_mask.shape != expected_shape:
+            raise ValueError(
+                f"node_mask must have shape {expected_shape}, got {tuple(node_mask.shape)}."
+            )
+
+        if node_mask is not None:
+            node_features = node_features * node_mask.unsqueeze(-1).to(node_features.dtype)
 
         prior = self.sample_prior(
             batch_size=batch_size,
@@ -404,9 +500,6 @@ class DiscreteDiffusion(nn.Module):
                 device=device,
             )
 
-        if node_mask is not None:
-            node_mask = node_mask.to(device)
-
         for i in reversed(range(self.num_steps)):
             t = torch.full(
                 size=(batch_size,),
@@ -418,6 +511,7 @@ class DiscreteDiffusion(nn.Module):
             x_t, e_t = self.p_sample_step(
                 model=model,
                 x_t=x_t,
+                node_features=node_features,
                 e_t=e_t,
                 t=t,
                 node_mask=node_mask,
@@ -435,12 +529,11 @@ class DiscreteDiffusion(nn.Module):
                 "X_chain": x_chain,
                 "E_chain": e_chain,
             }
-        
-        else:
-            return {
-                "X": x_t,
-                "E": e_t,
-            }, None
+
+        return {
+            "X": x_t,
+            "E": e_t,
+        }, None
 
 class DenseGraphAttentionBlock(nn.Module):
     def __init__(
@@ -486,6 +579,9 @@ class DenseGraphAttentionBlock(nn.Module):
     ) -> Tensor:
         B, N, H = h.shape
 
+        if node_mask is not None:
+            node_mask = node_mask.to(device=h.device, dtype=torch.bool)
+
         q = self.q_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
@@ -518,6 +614,7 @@ class TransformerDenoiser(nn.Module):
     def __init__(
         self,
         max_nodes: int = 64,
+        feature_dim: int = 3703,
         x_classes: int = 6,
         e_classes: int = 2,
         hidden_dim: int = 128,
@@ -533,6 +630,7 @@ class TransformerDenoiser(nn.Module):
             raise ValueError("num_layers must be at least 1.")
 
         self.max_nodes = max_nodes
+        self.feature_dim = feature_dim
         self.x_classes = x_classes
         self.e_classes = e_classes
         self.hidden_dim = hidden_dim
@@ -547,8 +645,19 @@ class TransformerDenoiser(nn.Module):
         self.node_embedding = nn.Embedding(x_classes, hidden_dim)
 
         self.node_input_proj = nn.Sequential(
-            nn.Linear(hidden_dim + time_emb_dim, hidden_dim),
+            nn.Linear(2 * hidden_dim + time_emb_dim, hidden_dim),
             nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        edge_input_dim = 3 * hidden_dim + time_emb_dim + e_classes
+
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout)
+            if dropout > 0.0 else nn.Identity(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
@@ -564,13 +673,10 @@ class TransformerDenoiser(nn.Module):
             ]
         )
 
-        edge_input_dim = 3 * hidden_dim + time_emb_dim + e_classes
         self.out_E = nn.Sequential(
             nn.Linear(edge_input_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
             nn.Linear(hidden_dim, e_classes),
         )
 
@@ -578,26 +684,63 @@ class TransformerDenoiser(nn.Module):
             nn.Linear(hidden_dim + time_emb_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
             nn.Linear(hidden_dim, self.x_classes),
         )
 
     def encode_nodes(
         self,
         x: Tensor,
+        node_features: Tensor,
         adj_noisy: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
     ) -> Tensor:
         B, N = x.shape
 
-        node_embed = self.node_embedding(x)
+        if node_mask is not None:
+            node_mask = node_mask.to(
+                device=x.device,
+                dtype=torch.bool,
+            )
+
+        node_features = node_features.to(device=x.device, dtype=torch.float)
+
+        if node_features.shape[:2] != (B, N):
+            raise ValueError(
+                "node_features must have shape [B, N, feature_dim], "
+                f"got {tuple(node_features.shape)} for x shape {tuple(x.shape)}."
+            )
+
+        if node_features.size(-1) != self.feature_dim:
+            raise ValueError(
+                f"Expected node feature dimension {self.feature_dim}, "
+                f"got {node_features.size(-1)}."
+            )
+
+        if node_mask is not None:
+            node_features = node_features * node_mask.unsqueeze(-1).to(node_features.dtype)
+
+        class_embed = self.node_embedding(x)
+
+        feature_embed = self.feature_encoder(
+            node_features.float()
+        )
 
         t_emb = self.time_embedding(t)
-        t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
+        t_node = t_emb[:, None, :].expand(
+            B,
+            N,
+            self.time_emb_dim,
+        )
 
-        h = torch.cat([node_embed, t_node], dim=-1)
+        h = torch.cat(
+            [
+                class_embed,
+                feature_embed,
+                t_node,
+            ],
+            dim=-1,
+        )
         h = self.node_input_proj(h)
 
         if node_mask is not None:
@@ -620,6 +763,9 @@ class TransformerDenoiser(nn.Module):
         node_mask: Tensor | None = None,
     ) -> Tensor:
         B, N, H = h.shape
+
+        if node_mask is not None:
+            node_mask = node_mask.to(device=h.device, dtype=torch.bool)
 
         h_i = h.unsqueeze(2).expand(B, N, N, H)
         h_j = h.unsqueeze(1).expand(B, N, N, H)
@@ -655,6 +801,9 @@ class TransformerDenoiser(nn.Module):
     ) -> Tensor:
         B, N, _ = h.shape
 
+        if node_mask is not None:
+            node_mask = node_mask.to(device=h.device, dtype=torch.bool)
+
         t_emb = self.time_embedding(t)
         t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
 
@@ -669,12 +818,14 @@ class TransformerDenoiser(nn.Module):
     def forward(
         self,
         x: Tensor,
+        node_features: Tensor,
         adj_noisy: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         h = self.encode_nodes(
             x=x,
+            node_features=node_features,
             adj_noisy=adj_noisy,
             t=t,
             node_mask=node_mask,
@@ -704,9 +855,17 @@ def main():
 
     B = 4
     N = 8
+    F = 3703
     x_classes = 6
     e_classes = 2
 
+    f = torch.randint(
+        0,
+        2,
+        (B, N, F),
+        dtype=torch.float,
+        device=device,
+    )
     x = torch.randint(0, x_classes, (B, N), dtype=torch.long, device=device)
     e = torch.randint(0, e_classes, (B, N, N), dtype=torch.long, device=device)
     e = torch.triu(e, diagonal=1)
@@ -742,6 +901,7 @@ def main():
 
     model = TransformerDenoiser(
         max_nodes=N,
+        feature_dim=F,
         x_classes=x_classes,
         e_classes=e_classes,
         hidden_dim=128,
@@ -753,6 +913,7 @@ def main():
 
     logits = model(
         x=noised["X_t"],
+        node_features=f,
         adj_noisy=noised["E_t"],
         t=t,
         node_mask=node_mask,
@@ -760,6 +921,7 @@ def main():
 
     sampled, chain = diffusion.sample(
         model=model,
+        node_features=f,
         batch_size=B,
         num_nodes=N,
         keep_chain=True,

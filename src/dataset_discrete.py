@@ -85,8 +85,8 @@ def get_data(path: Path):
     logger.info(f"Loading {DATASET}.")
 
     transform = T.Compose([
-        T.RandomNodeSplit(num_val=500, num_test=500),
-        T.RemoveIsolatedNodes(),
+        # T.RandomNodeSplit(num_val=500, num_test=500),
+        # T.RemoveIsolatedNodes(),
     ])
 
     dataset = Planetoid(
@@ -161,10 +161,12 @@ def extract_k_hop(data, root_node, num_hops=2, max_nodes: int = 64, min_nodes: i
             num_nodes=data.num_nodes,
         )
 
+    node_features = data.x[subset].float()
     node_labels = data.y[subset].long()
+    
 
     sub_data = Data(
-        x=node_labels,
+        x=node_features,
         edge_index=edge_index,
         y=node_labels,
         original_node_ids=subset,
@@ -227,6 +229,7 @@ def construct_dataloader(
         subgraphs,
         batch_size=batch_size,
         shuffle=shuffle,
+        drop_last=True,
     )
 
 
@@ -240,8 +243,9 @@ def estimate_class_distributions(
     edge_counts = torch.zeros(data.num_edge_classes, dtype=torch.long)
 
     for batch in loader:
-        x, adj, node_mask = to_dense(
+        node_features, node_labels, adj, node_mask = to_dense(
             x=batch.x,
+            y=batch.y,
             edge_index=batch.edge_index,
             edge_attr=getattr(batch, "edge_attr", None),
             batch=batch.batch,
@@ -249,7 +253,7 @@ def estimate_class_distributions(
             max_nodes=max_nodes,
         )
 
-        valid_x = x[node_mask]
+        valid_x = node_labels[node_mask]
         node_counts += torch.bincount(
             valid_x.long(),
             minlength=data.num_node_classes,
@@ -281,6 +285,7 @@ def estimate_class_distributions(
 
 def to_dense(
     x,
+    y,
     edge_index,
     edge_attr,
     batch,
@@ -323,6 +328,7 @@ def to_dense(
     )
 
     x = x[keep_node]
+    y = y[keep_node]
     batch = graph_id_map[batch[keep_node]]
 
     edge_index, edge_attr = remove_self_loops(edge_index, edge_attr)
@@ -332,24 +338,35 @@ def to_dense(
     if edge_attr is not None:
         edge_attr = edge_attr[keep_edge]
 
-    X, node_mask = to_dense_batch(
+    node_features, node_mask = to_dense_batch(
         x=x,
         batch=batch,
         max_num_nodes=max_nodes,
     )
-    X = X.long()
+    node_features = node_features.float()
 
-    A = to_dense_adj(
+    node_labels, label_mask = to_dense_batch(
+        x=y,
+        batch=batch,
+        max_num_nodes=node_features.size(1),
+        fill_value=0,
+    )
+    node_labels = node_labels.long()
+
+    if not torch.equal(node_mask, label_mask):
+        raise RuntimeError("Feature and label masks do not match after densification.")
+
+    adj = to_dense_adj(
         edge_index=edge_index,
         batch=batch,
         edge_attr=edge_attr,
-        max_num_nodes=X.size(1),
+        max_num_nodes=node_features.size(1),
     )
 
-    A = (A > 0).long()
-    A = torch.maximum(A, A.transpose(1, 2))
+    adj = (adj > 0).long()
+    adj = torch.maximum(adj, adj.transpose(1, 2))
 
-    return X, A, node_mask
+    return node_features, node_labels, adj, node_mask
 
 
 @app.command()
@@ -364,8 +381,8 @@ def main(
         data=data,
         num_samples=10_000,
         num_hops=3,
-        max_nodes=64,
-        min_nodes=2,
+        max_nodes=16,
+        min_nodes=4,
         batch_size=32,
         shuffle=True,
         seed=42,
@@ -377,8 +394,9 @@ def main(
     print(batch.x.shape)
     print(batch.edge_index.shape)
 
-    x, adj, node_mask = to_dense(
+    node_features, node_labels, adj, node_mask = to_dense(
         x=batch.x,
+        y=batch.y,
         edge_index=batch.edge_index,
         edge_attr=getattr(batch, "edge_attr", None),
         batch=batch.batch,
@@ -386,12 +404,17 @@ def main(
         max_nodes=None,
     )
 
-    print("x:", x.shape)
+    print("node_features:", node_features.shape)
+    print("node_labels:", node_labels.shape)
     print("adj:", adj.shape)
     print("mask:", node_mask.shape)
-    print("x dtype:", x.dtype)
+    print("node_features dtype:", node_features.dtype)
+    print("node_labels dtype:", node_labels.dtype)
     print("adj dtype:", adj.dtype)
-    print("unique node classes in batch:", torch.unique(x[node_mask]).tolist())
+    print(
+        "unique node classes in batch:",
+        torch.unique(node_labels[node_mask]).tolist(),
+    )
     print("unique edge classes in batch:", torch.unique(adj).tolist())
 
     num_batches = 0
