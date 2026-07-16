@@ -89,6 +89,7 @@ def graph_from_adjacency(x, e, node_mask):
         feats = x.detach().cpu()[valid_nodes]
 
     adj = adj[valid_nodes][:, valid_nodes]
+    adj = torch.maximum(adj, adj.transpose(0, 1))
     adj = (adj > 0.5).int().numpy()
 
     graph = nx.from_numpy_array(adj)
@@ -187,6 +188,7 @@ def gaussian_kernel_matrix(x: Tensor, y: Tensor, sigma: float | None = None):
 
 
 def mmd_from_stats(real_stats: list[Tensor], sampled_stats: list[Tensor]) -> float:
+    """Biased MMD estimator using one shared Gaussian-kernel bandwidth."""
     x = pad_stat_vectors(real_stats)
     y = pad_stat_vectors(sampled_stats)
 
@@ -199,17 +201,25 @@ def mmd_from_stats(real_stats: list[Tensor], sampled_stats: list[Tensor]) -> flo
     if y.size(1) < max_dim:
         y = torch.nn.functional.pad(y, (0, max_dim - y.size(1)))
 
-    k_xx = gaussian_kernel_matrix(x, x)
-    k_yy = gaussian_kernel_matrix(y, y)
-    k_xy = gaussian_kernel_matrix(x, y)
+    combined = torch.cat([x, y], dim=0)
+    combined_dist = torch.cdist(combined, combined, p=2).pow(2)
+    positive_dist = combined_dist[combined_dist > 0]
+    sigma = (
+        positive_dist.median().sqrt().item()
+        if positive_dist.numel() > 0
+        else 1.0
+    )
+
+    k_xx = gaussian_kernel_matrix(x, x, sigma=sigma)
+    k_yy = gaussian_kernel_matrix(y, y, sigma=sigma)
+    k_xy = gaussian_kernel_matrix(x, y, sigma=sigma)
 
     return (k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean()).item()
 
 
-def graph_adjacency_signature(graph: nx.Graph) -> bytes:
-    nodes = sorted(graph.nodes())
-    adj = nx.to_numpy_array(graph, nodelist=nodes, dtype="int8")
-    return adj.tobytes()
+def graph_adjacency_signature(graph: nx.Graph) -> str:
+    """Permutation-invariant structural signature for an unlabeled graph."""
+    return nx.weisfeiler_lehman_graph_hash(graph)
 
 
 def graph_uniqueness(graphs: list[nx.Graph]) -> float:
@@ -220,15 +230,106 @@ def graph_uniqueness(graphs: list[nx.Graph]) -> float:
     return len(set(signatures)) / len(signatures)
 
 
+def graph_num_nodes(graph: nx.Graph) -> float:
+    return float(graph.number_of_nodes())
+
+
+def graph_num_edges(graph: nx.Graph) -> float:
+    return float(graph.number_of_edges())
+
+
+def graph_density(graph: nx.Graph) -> float:
+    if graph.number_of_nodes() < 2:
+        return 0.0
+    return float(nx.density(graph))
+
+
+def graph_average_degree(graph: nx.Graph) -> float:
+    num_nodes = graph.number_of_nodes()
+    if num_nodes == 0:
+        return 0.0
+    return float(2.0 * graph.number_of_edges() / num_nodes)
+
+
+def graph_max_degree(graph: nx.Graph) -> float:
+    if graph.number_of_nodes() == 0:
+        return 0.0
+    return float(max(degree for _, degree in graph.degree()))
+
+
+def graph_average_clustering(graph: nx.Graph) -> float:
+    if graph.number_of_nodes() == 0:
+        return 0.0
+    return float(nx.average_clustering(graph))
+
+
+def graph_num_components(graph: nx.Graph) -> float:
+    if graph.number_of_nodes() == 0:
+        return 0.0
+    return float(nx.number_connected_components(graph))
+
+
+def graph_largest_component_size(graph: nx.Graph) -> float:
+    if graph.number_of_nodes() == 0:
+        return 0.0
+    return float(max(len(component) for component in nx.connected_components(graph)))
+
+
+def graph_largest_component_fraction(graph: nx.Graph) -> float:
+    num_nodes = graph.number_of_nodes()
+    if num_nodes == 0:
+        return 0.0
+    return graph_largest_component_size(graph) / num_nodes
+
+
+def graph_connected_fraction(graphs: list[nx.Graph]) -> float:
+    if len(graphs) == 0:
+        return float("nan")
+    connected = [
+        float(graph.number_of_nodes() > 0 and nx.is_connected(graph))
+        for graph in graphs
+    ]
+    return sum(connected) / len(connected)
+
+
+def mean_graph_stat(graphs: list[nx.Graph], statistic) -> float:
+    if len(graphs) == 0:
+        return float("nan")
+    values = [float(statistic(graph)) for graph in graphs]
+    return sum(values) / len(values)
+
+
+def std_graph_stat(graphs: list[nx.Graph], statistic) -> float:
+    if len(graphs) == 0:
+        return float("nan")
+    values = torch.tensor(
+        [float(statistic(graph)) for graph in graphs],
+        dtype=torch.float,
+    )
+    return values.std(unbiased=False).item()
+
+
 def evaluate_generated_graphs(real_e, sampled_e, node_mask):
-    """Evaluate structural graph statistics, ignoring node colours/types."""
+    """
+    Evaluate generated undirected graphs using direct graph statistics and
+    distributional metrics commonly reported for graph generative models.
+
+    Node labels are intentionally ignored here. Each graph is first restricted
+    to valid nodes from node_mask.
+    """
     num_graphs = min(real_e.size(0), sampled_e.size(0), node_mask.size(0))
     real_e = real_e[:num_graphs]
     sampled_e = sampled_e[:num_graphs]
     node_mask = node_mask[:num_graphs]
 
-    real_graphs = [graph_only_from_adjacency(real_e[i], node_mask[i]) for i in range(num_graphs)]
-    sampled_graphs = [graph_only_from_adjacency(sampled_e[i], node_mask[i]) for i in range(num_graphs)]
+    real_graphs = [
+        graph_only_from_adjacency(real_e[i], node_mask[i])
+        for i in range(num_graphs)
+    ]
+    sampled_graphs = [
+        graph_only_from_adjacency(sampled_e[i], node_mask[i])
+        for i in range(num_graphs)
+    ]
 
     real_degree_stats = [graph_degree_histogram(graph) for graph in real_graphs]
     sampled_degree_stats = [graph_degree_histogram(graph) for graph in sampled_graphs]
@@ -239,14 +340,63 @@ def evaluate_generated_graphs(real_e, sampled_e, node_mask):
     real_orbit_stats = [graph_orbit_features(graph) for graph in real_graphs]
     sampled_orbit_stats = [graph_orbit_features(graph) for graph in sampled_graphs]
 
-    return {
+    metrics = {
+        # Distributional metrics used in graph-generation evaluation.
         "degree_mmd": mmd_from_stats(real_degree_stats, sampled_degree_stats),
         "cluster_mmd": mmd_from_stats(real_cluster_stats, sampled_cluster_stats),
         "orbit_mmd": mmd_from_stats(real_orbit_stats, sampled_orbit_stats),
+
+        # Sample diversity.
         "uniqueness": graph_uniqueness(sampled_graphs),
-        "real_edges_mean": sum(graph.number_of_edges() for graph in real_graphs) / max(len(real_graphs), 1),
-        "sampled_edges_mean": sum(graph.number_of_edges() for graph in sampled_graphs) / max(len(sampled_graphs), 1),
+
+        # Graph-size statistics.
+        "real_num_nodes_mean": mean_graph_stat(real_graphs, graph_num_nodes),
+        "sampled_num_nodes_mean": mean_graph_stat(sampled_graphs, graph_num_nodes),
+        "real_num_nodes_std": std_graph_stat(real_graphs, graph_num_nodes),
+        "sampled_num_nodes_std": std_graph_stat(sampled_graphs, graph_num_nodes),
+        "real_num_edges_mean": mean_graph_stat(real_graphs, graph_num_edges),
+        "sampled_num_edges_mean": mean_graph_stat(sampled_graphs, graph_num_edges),
+        "real_num_edges_std": std_graph_stat(real_graphs, graph_num_edges),
+        "sampled_num_edges_std": std_graph_stat(sampled_graphs, graph_num_edges),
+
+        # Density and degree statistics.
+        "real_density_mean": mean_graph_stat(real_graphs, graph_density),
+        "sampled_density_mean": mean_graph_stat(sampled_graphs, graph_density),
+        "real_density_std": std_graph_stat(real_graphs, graph_density),
+        "sampled_density_std": std_graph_stat(sampled_graphs, graph_density),
+        "real_avg_degree_mean": mean_graph_stat(real_graphs, graph_average_degree),
+        "sampled_avg_degree_mean": mean_graph_stat(sampled_graphs, graph_average_degree),
+        "real_avg_degree_std": std_graph_stat(real_graphs, graph_average_degree),
+        "sampled_avg_degree_std": std_graph_stat(sampled_graphs, graph_average_degree),
+        "real_max_degree_mean": mean_graph_stat(real_graphs, graph_max_degree),
+        "sampled_max_degree_mean": mean_graph_stat(sampled_graphs, graph_max_degree),
+
+        # Local structure.
+        "real_avg_clustering_mean": mean_graph_stat(real_graphs, graph_average_clustering),
+        "sampled_avg_clustering_mean": mean_graph_stat(sampled_graphs, graph_average_clustering),
+        "real_avg_clustering_std": std_graph_stat(real_graphs, graph_average_clustering),
+        "sampled_avg_clustering_std": std_graph_stat(sampled_graphs, graph_average_clustering),
+
+        # Connectivity.
+        "real_num_components_mean": mean_graph_stat(real_graphs, graph_num_components),
+        "sampled_num_components_mean": mean_graph_stat(sampled_graphs, graph_num_components),
+        "real_num_components_std": std_graph_stat(real_graphs, graph_num_components),
+        "sampled_num_components_std": std_graph_stat(sampled_graphs, graph_num_components),
+        "real_largest_component_mean": mean_graph_stat(real_graphs, graph_largest_component_size),
+        "sampled_largest_component_mean": mean_graph_stat(sampled_graphs, graph_largest_component_size),
+        "real_largest_component_fraction_mean": mean_graph_stat(
+            real_graphs,
+            graph_largest_component_fraction,
+        ),
+        "sampled_largest_component_fraction_mean": mean_graph_stat(
+            sampled_graphs,
+            graph_largest_component_fraction,
+        ),
+        "real_connected_fraction": graph_connected_fraction(real_graphs),
+        "sampled_connected_fraction": graph_connected_fraction(sampled_graphs),
     }
+
+    return metrics
 
 
 def masked_node_cross_entropy(logits, target, node_mask=None):
@@ -286,3 +436,64 @@ def masked_upper_edge_cross_entropy(logits, target, node_mask=None):
     target = target[upper_mask]
 
     return F.cross_entropy(logits, target.long())
+
+def masked_multiclass_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    node_mask: torch.Tensor,
+    num_classes: int,
+    prefix: str,
+):
+    pred = pred[node_mask].detach()
+    target = target[node_mask].detach()
+
+    if target.numel() == 0:
+        return {
+            f"{prefix}/accuracy": 0.0,
+            f"{prefix}/macro_precision": 0.0,
+            f"{prefix}/macro_recall": 0.0,
+            f"{prefix}/macro_f1": 0.0,
+        }
+
+    eps = 1e-8
+    accuracy = (pred == target).float().mean().item()
+
+    per_class_metrics = {}
+    precisions = []
+    recalls = []
+    f1s = []
+
+    for class_idx in range(num_classes):
+        pred_is_class = pred == class_idx
+        target_is_class = target == class_idx
+
+        true_positive = (pred_is_class & target_is_class).float().sum()
+        false_positive = (pred_is_class & ~target_is_class).float().sum()
+        false_negative = (~pred_is_class & target_is_class).float().sum()
+        support = target_is_class.float().sum()
+
+        precision = true_positive / (true_positive + false_positive + eps)
+        recall = true_positive / (true_positive + false_negative + eps)
+        f1 = 2.0 * precision * recall / (precision + recall + eps)
+
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+
+        per_class_metrics[f"{prefix}/class_{class_idx}_precision"] = precision.item()
+        per_class_metrics[f"{prefix}/class_{class_idx}_recall"] = recall.item()
+        per_class_metrics[f"{prefix}/class_{class_idx}_f1"] = f1.item()
+        per_class_metrics[f"{prefix}/class_{class_idx}_support"] = support.item()
+
+    macro_precision = torch.stack(precisions).mean().item()
+    macro_recall = torch.stack(recalls).mean().item()
+    macro_f1 = torch.stack(f1s).mean().item()
+
+    metrics = {
+        f"{prefix}/accuracy": accuracy,
+        f"{prefix}/macro_precision": macro_precision,
+        f"{prefix}/macro_recall": macro_recall,
+        f"{prefix}/macro_f1": macro_f1,
+    }
+    metrics.update(per_class_metrics)
+    return metrics

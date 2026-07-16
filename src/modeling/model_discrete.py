@@ -7,10 +7,6 @@ import math
 import torch
 from torch import nn
 from torch import Tensor
-import matplotlib.pyplot as plt
-import networkx as nx
-
-from src.modeling.utils import graph_from_adjacency
 
 app = typer.Typer()
 
@@ -272,17 +268,14 @@ class DiscreteDiffusion(nn.Module):
         self,
         model: nn.Module,
         x_t: Tensor,
-        node_features: Tensor,
         e_t: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
     ):
         node_mask = self._normalize_node_mask(node_mask, x_t.device)
-        node_features = node_features.to(device=x_t.device, dtype=torch.float)
 
         logits = model(
             x=x_t,
-            node_features=node_features,
             adj_noisy=e_t,
             t=t,
             node_mask=node_mask,
@@ -440,7 +433,6 @@ class DiscreteDiffusion(nn.Module):
     def sample(
         self,
         model: nn.Module,
-        node_features: Tensor,
         batch_size: int,
         num_nodes: int,
         keep_chain: bool = False,
@@ -453,23 +445,13 @@ class DiscreteDiffusion(nn.Module):
 
         device = torch.device(device)
         node_mask = self._normalize_node_mask(node_mask, device)
-        node_features = node_features.to(device=device, dtype=torch.float)
 
         expected_shape = (batch_size, num_nodes)
-        if node_features.shape[:2] != expected_shape:
-            raise ValueError(
-                "node_features must have shape "
-                f"[batch_size, num_nodes, feature_dim], got {tuple(node_features.shape)} "
-                f"for batch_size={batch_size} and num_nodes={num_nodes}."
-            )
 
         if node_mask is not None and node_mask.shape != expected_shape:
             raise ValueError(
                 f"node_mask must have shape {expected_shape}, got {tuple(node_mask.shape)}."
             )
-
-        if node_mask is not None:
-            node_features = node_features * node_mask.unsqueeze(-1).to(node_features.dtype)
 
         prior = self.sample_prior(
             batch_size=batch_size,
@@ -511,7 +493,6 @@ class DiscreteDiffusion(nn.Module):
             x_t, e_t = self.p_sample_step(
                 model=model,
                 x_t=x_t,
-                node_features=node_features,
                 e_t=e_t,
                 t=t,
                 node_mask=node_mask,
@@ -558,7 +539,6 @@ class DenseGraphAttentionBlock(nn.Module):
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.edge_bias = nn.Embedding(e_classes, num_heads)
 
         self.dropout = nn.Dropout(dropout)
         self.norm_attn = nn.LayerNorm(hidden_dim)
@@ -571,24 +551,73 @@ class DenseGraphAttentionBlock(nn.Module):
             nn.Linear(4 * hidden_dim, hidden_dim),
         )
 
+        # DiGress-style edge conditioning: project the categorical noisy edge
+        # state to feature-wise FiLM scale and shift vectors.
+        self.e_add = nn.Linear(e_classes, hidden_dim)
+        self.e_mul = nn.Linear(e_classes, hidden_dim)
+
+        # Start from ordinary dot-product attention and let training learn how
+        # edge states should modify the pairwise query-key interaction.
+        nn.init.zeros_(self.e_add.weight)
+        nn.init.zeros_(self.e_add.bias)
+        nn.init.zeros_(self.e_mul.weight)
+        nn.init.zeros_(self.e_mul.bias)
+
     def forward(
         self,
         h: Tensor,
-        adj_noisy: Tensor,
+        noisy_adj: Tensor,
         node_mask: Tensor | None = None,
     ) -> Tensor:
         B, N, H = h.shape
 
+        # Keep Q, K, and V in the full hidden dimension while constructing the
+        # edge-conditioned pairwise interaction.
+        q_full = self.q_proj(h)  # [B, N, H]
+        k_full = self.k_proj(h)  # [B, N, H]
+        v = self.v_proj(h).view(
+            B,
+            N,
+            self.num_heads,
+            self.head_dim,
+        ).transpose(1, 2)  # [B, heads, N, head_dim]
+
+        # Element-wise query-key interaction for every ordered node pair.
+        pairwise_qk = q_full.unsqueeze(2) * k_full.unsqueeze(1)
+        # [B, N, N, H]
+
+        edge_one_hot = torch.nn.functional.one_hot(
+            noisy_adj.long(),
+            num_classes=self.e_classes,
+        ).to(dtype=h.dtype)
+        # [B, N, N, e_classes]
+
+        edge_add = self.e_add(edge_one_hot)
+        edge_mul = self.e_mul(edge_one_hot)
+        # [B, N, N, H]
+
         if node_mask is not None:
-            node_mask = node_mask.to(device=h.device, dtype=torch.bool)
+            pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
+            pair_mask = pair_mask.unsqueeze(-1).to(dtype=h.dtype)
+            edge_add = edge_add * pair_mask
+            edge_mul = edge_mul * pair_mask
 
-        q = self.q_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        # FiLM modulation conditioned on the noisy edge class.
+        pairwise_qk = pairwise_qk * (1.0 + edge_mul) + edge_add
 
-        attn_scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        edge_bias = self.edge_bias(adj_noisy.long()).permute(0, 3, 1, 2)
-        attn_scores = attn_scores + edge_bias
+        # Split the modulated hidden representation into attention heads.
+        pairwise_qk = pairwise_qk.view(
+            B,
+            N,
+            N,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 3, 1, 2, 4)
+        # [B, heads, N, N, head_dim]
+
+        # Reduce each head's vector-valued interaction to a scalar score.
+        attn_scores = pairwise_qk.sum(dim=-1) * self.scale
+        # [B, heads, N, N]
 
         if node_mask is not None:
             key_mask = node_mask[:, None, None, :]
@@ -623,6 +652,7 @@ class TransformerDenoiser(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.0,
         force_symmetric_output: bool = True,
+        diffusion: nn.Module = None,
     ):
         super().__init__()
 
@@ -639,27 +669,23 @@ class TransformerDenoiser(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.force_symmetric_output = force_symmetric_output
+        self.diffusion = diffusion
+        if self.diffusion is None:
+            raise ValueError(
+                "TransformerDenoiser requires a diffusion instance for log-SNR time conditioning."
+            )
 
         self.time_embedding = SinusoidalTimeEmbedding(time_emb_dim)
 
         self.node_embedding = nn.Embedding(x_classes, hidden_dim)
 
         self.node_input_proj = nn.Sequential(
-            nn.Linear(2 * hidden_dim + time_emb_dim, hidden_dim),
+            nn.Linear(hidden_dim + time_emb_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
         edge_input_dim = 3 * hidden_dim + time_emb_dim + e_classes
-
-        self.feature_encoder = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout)
-            if dropout > 0.0 else nn.Identity(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
 
         self.attn_layers = nn.ModuleList(
             [
@@ -687,10 +713,18 @@ class TransformerDenoiser(nn.Module):
             nn.Linear(hidden_dim, self.x_classes),
         )
 
+    def get_time_embedding(self, t: Tensor) -> Tensor:
+        """Embed the diffusion noise level using log signal-to-noise ratio."""
+        alpha_bar_t = self.diffusion.alpha_bars[t]
+        log_snr = (
+            torch.log(alpha_bar_t.clamp_min(1e-8))
+            - torch.log((1.0 - alpha_bar_t).clamp_min(1e-8))
+        )
+        return self.time_embedding(log_snr)
+
     def encode_nodes(
         self,
         x: Tensor,
-        node_features: Tensor,
         adj_noisy: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
@@ -703,44 +737,12 @@ class TransformerDenoiser(nn.Module):
                 dtype=torch.bool,
             )
 
-        node_features = node_features.to(device=x.device, dtype=torch.float)
-
-        if node_features.shape[:2] != (B, N):
-            raise ValueError(
-                "node_features must have shape [B, N, feature_dim], "
-                f"got {tuple(node_features.shape)} for x shape {tuple(x.shape)}."
-            )
-
-        if node_features.size(-1) != self.feature_dim:
-            raise ValueError(
-                f"Expected node feature dimension {self.feature_dim}, "
-                f"got {node_features.size(-1)}."
-            )
-
-        if node_mask is not None:
-            node_features = node_features * node_mask.unsqueeze(-1).to(node_features.dtype)
-
         class_embed = self.node_embedding(x)
 
-        feature_embed = self.feature_encoder(
-            node_features.float()
-        )
+        t_emb = self.get_time_embedding(t)
+        t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
 
-        t_emb = self.time_embedding(t)
-        t_node = t_emb[:, None, :].expand(
-            B,
-            N,
-            self.time_emb_dim,
-        )
-
-        h = torch.cat(
-            [
-                class_embed,
-                feature_embed,
-                t_node,
-            ],
-            dim=-1,
-        )
+        h = torch.cat([class_embed, t_node], dim=-1)
         h = self.node_input_proj(h)
 
         if node_mask is not None:
@@ -749,7 +751,7 @@ class TransformerDenoiser(nn.Module):
         for attn_layer in self.attn_layers:
             h = attn_layer(
                 h=h,
-                adj_noisy=adj_noisy,
+                noisy_adj=adj_noisy,
                 node_mask=node_mask,
             )
 
@@ -771,7 +773,7 @@ class TransformerDenoiser(nn.Module):
         h_j = h.unsqueeze(1).expand(B, N, N, H)
         h_pair = h_i * h_j
 
-        t_emb = self.time_embedding(t)
+        t_emb = self.get_time_embedding(t)
         t_pair = t_emb[:, None, None, :].expand(B, N, N, self.time_emb_dim)
         adj_pair = torch.nn.functional.one_hot(
             adj_noisy.long(),
@@ -804,7 +806,7 @@ class TransformerDenoiser(nn.Module):
         if node_mask is not None:
             node_mask = node_mask.to(device=h.device, dtype=torch.bool)
 
-        t_emb = self.time_embedding(t)
+        t_emb = self.get_time_embedding(t)
         t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
 
         x_input = torch.cat([h, t_node], dim=-1)
@@ -818,14 +820,12 @@ class TransformerDenoiser(nn.Module):
     def forward(
         self,
         x: Tensor,
-        node_features: Tensor,
         adj_noisy: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         h = self.encode_nodes(
             x=x,
-            node_features=node_features,
             adj_noisy=adj_noisy,
             t=t,
             node_mask=node_mask,
@@ -871,7 +871,7 @@ def main():
     e = torch.triu(e, diagonal=1)
     e = e + e.transpose(1, 2)
 
-    node_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+    node_mask = torch.randint(0, 2, (B, N), dtype=torch.bool, device=device)
 
     diffusion = DiscreteDiffusion(
         x_classes=x_classes,
@@ -909,11 +909,11 @@ def main():
         num_layers=2,
         num_heads=4,
         dropout=0.0,
+        diffusion=diffusion,
     ).to(device)
 
     logits = model(
         x=noised["X_t"],
-        node_features=f,
         adj_noisy=noised["E_t"],
         t=t,
         node_mask=node_mask,
@@ -921,7 +921,6 @@ def main():
 
     sampled, chain = diffusion.sample(
         model=model,
-        node_features=f,
         batch_size=B,
         num_nodes=N,
         keep_chain=True,

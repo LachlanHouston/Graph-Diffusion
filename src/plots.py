@@ -602,8 +602,6 @@ def log_discrete_samples(
         node_mask=node_mask,
     )
 
-    logger.info(f"Discrete sample metrics at epoch {epoch}: {metrics}")
-
     fig = make_sample_figure(
         real_x=real_x,
         real_e=real_e,
@@ -614,19 +612,58 @@ def log_discrete_samples(
     )
 
     if wandb_mode != "disabled":
+        wandb_payload = {
+            "samples/real_vs_sampled": wandb.Image(
+                fig,
+                caption=f"Epoch {epoch}",
+            ),
+        }
+
+        summary_metrics = {
+            "eval_summary/degree_mmd": metrics["degree_mmd"],
+            "eval_summary/cluster_mmd": metrics["cluster_mmd"],
+            "eval_summary/orbit_mmd": metrics["orbit_mmd"],
+            "eval_summary/uniqueness": metrics["uniqueness"],
+            "eval_summary/density_abs_error": abs(
+                metrics["sampled_density_mean"]
+                - metrics["real_density_mean"]
+            ),
+            "eval_summary/avg_degree_abs_error": abs(
+                metrics["sampled_avg_degree_mean"]
+                - metrics["real_avg_degree_mean"]
+            ),
+            "eval_summary/avg_clustering_abs_error": abs(
+                metrics["sampled_avg_clustering_mean"]
+                - metrics["real_avg_clustering_mean"]
+            ),
+            "eval_summary/num_components_abs_error": abs(
+                metrics["sampled_num_components_mean"]
+                - metrics["real_num_components_mean"]
+            ),
+            "eval_summary/largest_component_fraction_abs_error": abs(
+                metrics["sampled_largest_component_fraction_mean"]
+                - metrics["real_largest_component_fraction_mean"]
+            ),
+            "eval_summary/connected_fraction_abs_error": abs(
+                metrics["sampled_connected_fraction"]
+                - metrics["real_connected_fraction"]
+            ),
+        }
+
+        wandb_payload.update(summary_metrics)
+
+        metric_table = wandb.Table(
+            columns=["metric", "value"],
+            data=[
+                [metric_name, float(metric_value)]
+                for metric_name, metric_value in sorted(metrics.items())
+            ],
+        )
+
+        wandb_payload["eval_details/all_metrics"] = metric_table
+
         wandb.log(
-            {
-                "samples/real_vs_sampled": wandb.Image(
-                    fig,
-                    caption=f"Epoch {epoch}",
-                ),
-                "eval/degree_mmd": metrics["degree_mmd"],
-                "eval/cluster_mmd": metrics["cluster_mmd"],
-                "eval/orbit_mmd": metrics["orbit_mmd"],
-                "eval/uniqueness": metrics["uniqueness"],
-                "eval/real_edges_mean": metrics["real_edges_mean"],
-                "eval/sampled_edges_mean": metrics["sampled_edges_mean"],
-            },
+            wandb_payload,
             step=global_step,
         )
 
@@ -639,7 +676,6 @@ def log_discrete_samples(
 def plot_tsne(
     embeddings,
     labels,
-    n_classes: int,
     output_dir: Path,
     epoch: int,
     global_step: int,
@@ -713,18 +749,25 @@ def plot_tsne(
 
     fig, ax = plt.subplots(figsize=(8, 7))
 
-    scatter = ax.scatter(
-        projected[:, 0],
-        projected[:, 1],
-        c=labels,
-        s=18,
-        alpha=0.75,
-        cmap="tab10",
+    class_ids = sorted(
+        int(class_id)
+        for class_id in np.unique(labels).tolist()
     )
-
-    class_ids = sorted(int(class_id) for class_id in np.unique(labels).tolist())
     names = label_names()
     cmap = plt.get_cmap("tab10")
+
+    point_colours = [
+        cmap(int(class_id) % cmap.N)
+        for class_id in labels
+    ]
+
+    ax.scatter(
+        projected[:, 0],
+        projected[:, 1],
+        c=point_colours,
+        s=18,
+        alpha=0.75,
+    )
 
     legend_handles = [
         Line2D(

@@ -85,8 +85,8 @@ def get_data(path: Path):
     logger.info(f"Loading {DATASET}.")
 
     transform = T.Compose([
-        # T.RandomNodeSplit(num_val=500, num_test=500),
-        # T.RemoveIsolatedNodes(),
+        T.RandomNodeSplit(num_val=100, num_test=100),
+        T.RemoveIsolatedNodes(),
     ])
 
     dataset = Planetoid(
@@ -99,17 +99,6 @@ def get_data(path: Path):
     data = dataset[0]
     data.num_node_classes = dataset.num_classes
     data.num_edge_classes = 2
-
-    print(f"Raw data statistics for: {DATASET}")
-    print("-"*25)
-    print(data)
-    print("num_nodes:", data.num_nodes)
-    print("num_edges:", data.num_edges)
-    print("num_features:", data.num_features)
-    print("num_classes:", dataset.num_classes)
-    print("discrete node feature:", data.y)
-    print("num_node_classes:", data.num_node_classes)
-    print("num_edge_classes:", data.num_edge_classes)
 
     return data
 
@@ -163,7 +152,6 @@ def extract_k_hop(data, root_node, num_hops=2, max_nodes: int = 64, min_nodes: i
 
     node_features = data.x[subset].float()
     node_labels = data.y[subset].long()
-    
 
     sub_data = Data(
         x=node_features,
@@ -181,56 +169,53 @@ def extract_k_hop(data, root_node, num_hops=2, max_nodes: int = 64, min_nodes: i
     
 def construct_dataloader(
     data,
-    num_samples: int = 10_000,
     num_hops: int = 2,
     max_nodes: int = 64,
     min_nodes: int = 8,
     seed: int = 0,
     batch_size: int = 32,
-    shuffle: bool = False,
+    shuffle: bool = True,
 ):
-    train_nodes = data.train_mask.nonzero(as_tuple=False).view(-1)
+    split_nodes = {
+        "train": data.train_mask.nonzero(as_tuple=False).view(-1),
+        "val": data.val_mask.nonzero(as_tuple=False).view(-1),
+        "test": data.test_mask.nonzero(as_tuple=False).view(-1),
+    }
 
     generator = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(train_nodes.numel(), generator=generator)
+    loaders = {}
 
-    sample_nodes = train_nodes[perm]
+    for split_name, nodes in split_nodes.items():
+        permutation = torch.randperm(nodes.numel(), generator=generator)
+        nodes = nodes[permutation]
 
-    subgraphs = []
-    for root_node in sample_nodes:
-        subgraph_data = extract_k_hop(
-            data=data,
-            root_node=root_node,
-            num_hops=num_hops,
-            max_nodes=max_nodes,
-            min_nodes=min_nodes,
+        subgraphs = []
+        for root_node in nodes:
+            subgraph_data = extract_k_hop(
+                data=data,
+                root_node=root_node,
+                num_hops=num_hops,
+                max_nodes=max_nodes,
+                min_nodes=min_nodes,
+            )
+
+            if subgraph_data is not None:
+                subgraphs.append(subgraph_data)
+
+        if len(subgraphs) == 0:
+            raise ValueError(
+                f"No connected {split_name} k-hop subgraphs found with "
+                f"min_nodes={min_nodes} and max_nodes={max_nodes}."
+            )
+
+        loaders[split_name] = DataLoader(
+            subgraphs,
+            batch_size=batch_size,
+            shuffle=shuffle if split_name == "train" else False,
+            drop_last=split_name == "train",
         )
 
-        if subgraph_data is None:
-            continue
-
-        subgraphs.append(subgraph_data)
-
-        if len(subgraphs) >= num_samples:
-            break
-
-    if len(subgraphs) == 0:
-        raise ValueError(
-            f"No connected k-hop subgraphs found with min_nodes={min_nodes} and max_nodes={max_nodes}."
-        )
-
-    logger.info(
-        f"Using KHopSubgraphDataset with num_samples={num_samples}, "
-        f"num_hops={num_hops}, batch_size={batch_size}, "
-        f"min_nodes={min_nodes}, max_nodes={max_nodes}."
-    )
-
-    return DataLoader(
-        subgraphs,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=True,
-    )
+    return loaders["train"], loaders["val"], loaders["test"]
 
 
 def estimate_class_distributions(
@@ -377,9 +362,8 @@ def main(
     # ----------------------------------------------
 ):
     data = get_data(output_path)
-    loader = construct_dataloader(
+    train_loader, val_loader, test_loader = construct_dataloader(
         data=data,
-        num_samples=10_000,
         num_hops=3,
         max_nodes=16,
         min_nodes=4,
@@ -388,11 +372,7 @@ def main(
         seed=42,
     )
 
-    batch = next(iter(loader))
-
-    print(batch)
-    print(batch.x.shape)
-    print(batch.edge_index.shape)
+    batch = next(iter(train_loader))
 
     node_features, node_labels, adj, node_mask = to_dense(
         x=batch.x,
@@ -408,31 +388,10 @@ def main(
     print("node_labels:", node_labels.shape)
     print("adj:", adj.shape)
     print("mask:", node_mask.shape)
-    print("node_features dtype:", node_features.dtype)
-    print("node_labels dtype:", node_labels.dtype)
-    print("adj dtype:", adj.dtype)
-    print(
-        "unique node classes in batch:",
-        torch.unique(node_labels[node_mask]).tolist(),
-    )
-    print("unique edge classes in batch:", torch.unique(adj).tolist())
 
-    num_batches = 0
-    for i, _ in enumerate(loader):
-        num_batches += 1
-    print(f"Number of batches per epoch: {num_batches}")
-
-    distributions = estimate_class_distributions(
-        data=data,
-        loader=loader,
-        max_nodes=64,
-        min_nodes=2,
-    )
-
-    print("node class counts:", distributions["node_counts"].tolist())
-    print("node class probs:", distributions["node_probs"].tolist())
-    print("edge class counts [no-edge, edge]:", distributions["edge_counts"].tolist())
-    print("edge class probs [no-edge, edge]:", distributions["edge_probs"].tolist())
+    print(f"Train batches per epoch: {len(train_loader)}")
+    print(f"Validation batches: {len(val_loader)}")
+    print(f"Test batches: {len(test_loader)}")
 
     print("Done Testing!")
 
