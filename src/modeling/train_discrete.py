@@ -136,7 +136,7 @@ def main(
 
             t = sample_timesteps(
                 batch_size=e0.shape[0],
-                num_steps=diffusion.num_steps,
+                num_steps=diffusion.T,
                 device=device,
             )
 
@@ -233,7 +233,7 @@ def main(
             with torch.no_grad():
                 t = torch.full(
                     (val_x0.size(0),),
-                    fill_value=diffusion.num_steps // 2,
+                    fill_value=diffusion.T // 2,
                     dtype=torch.long,
                     device=val_x0.device,
                 )

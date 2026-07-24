@@ -80,9 +80,9 @@ class DiscreteDiffusion(nn.Module):
         self.beta_end = beta_end
         self.x_classes = x_classes
         self.e_classes = e_classes
-        self.num_steps = num_steps
+        self.T = num_steps
 
-        betas = linear_beta_schedule(num_steps=self.num_steps, beta_start=self.beta_start, beta_end=self.beta_end)
+        betas = linear_beta_schedule(num_steps=self.T, beta_start=self.beta_start, beta_end=self.beta_end)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
 
@@ -467,14 +467,14 @@ class DiscreteDiffusion(nn.Module):
         e_chain = None
         if keep_chain:
             x_chain = torch.zeros(
-                self.num_steps,
+                self.T,
                 min(n_chains, batch_size),
                 x_t.size(1),
                 dtype=torch.long,
                 device=device,
             )
             e_chain = torch.zeros(
-                self.num_steps,
+                self.T,
                 min(n_chains, batch_size),
                 e_t.size(1),
                 e_t.size(2),
@@ -482,7 +482,7 @@ class DiscreteDiffusion(nn.Module):
                 device=device,
             )
 
-        for i in reversed(range(self.num_steps)):
+        for i in reversed(range(self.T)):
             t = torch.full(
                 size=(batch_size,),
                 fill_value=i,
@@ -499,8 +499,8 @@ class DiscreteDiffusion(nn.Module):
             )
 
             if keep_chain:
-                x_chain[self.num_steps - i - 1] = x_t[: x_chain.size(1)]
-                e_chain[self.num_steps - i - 1] = e_t[: e_chain.size(1)]
+                x_chain[self.T - i - 1] = x_t[: x_chain.size(1)]
+                e_chain[self.T - i - 1] = e_t[: e_chain.size(1)]
 
         if keep_chain:
             return {
@@ -881,7 +881,7 @@ def main():
 
     t = sample_timesteps(
         batch_size=B,
-        num_steps=diffusion.num_steps,
+        num_steps=diffusion.T,
         device=device,
     )
 
