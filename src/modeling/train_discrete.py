@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import wandb
 
 from src.config import MODELS_DIR, PROCESSED_DATA_DIR
-from src.dataset_discrete import (
+from src.dataset_ego import (
     get_data,
     construct_dataloader,
     to_dense,
@@ -27,11 +27,11 @@ app = typer.Typer()
 @app.command()
 def main(
     model_prefix: Path = "model_discrete.pt",
-    max_epochs: int = 5,
+    max_epochs: int = 1000,
     batch_size: int = 32,
-    max_nodes: int = 16,
+    min_nodes: int = 1,
+    max_nodes: int = 18,
     num_hops: int = 3,
-    min_nodes: int = 4,
     diffusion_steps: int = 1000,
     hidden_dimension: int = 128,
     num_layers: int = 2,
@@ -39,10 +39,10 @@ def main(
     time_emb_dim: int = 16,
     lr: float = 1e-4,
     dropout: float = 0.1,
-    x_loss_scale: float = 4.0,
+    x_loss_scale: float = 1.0,
     wandb_project: str = "graph-diffusion",
     wandb_entity: str | None = None,
-    wandb_run_name: str = "local_discrete_run",
+    wandb_run_name: str = "local_ego_run",
     wandb_mode: str = "online",
     wandb_log_interval: int = 10,
     seed: int = 42,
@@ -59,11 +59,8 @@ def main(
 
     train_loader, val_loader, test_loader = construct_dataloader(
         data=data,
-        num_hops=num_hops,
-        max_nodes=max_nodes,
-        min_nodes=min_nodes,
-        batch_size=batch_size,
         seed=seed,
+        batch_size=batch_size,
         shuffle=True,
     )
 
