@@ -1,408 +1,546 @@
 from pathlib import Path
+import os
+import subprocess as sp
+import copy
 
-from loguru import logger
 from tqdm import tqdm
-import typer
 import torch
-import pandas as pd
-import matplotlib.pyplot as plt
+import typer
+from scipy.linalg import eigvalsh
+import numpy as np
 import networkx as nx
 
-from src.config import MODELS_DIR, PROCESSED_DATA_DIR, FIGURES_DIR
-from src.dataset import get_data, construct_dataloader, batch_to_dense
-from src.modeling.model import GaussianDiffusion, Linear_Denoiser, GAT_Denoiser
+from src.config import ORCA_DIR, PROCESSED_DATA_DIR, MODELS_DIR
+from src.dataset_discrete import get_data, construct_dataloader, to_dense, DATASET
+from src.modeling.model_discrete import DiscreteDiffusion, TransformerDenoiser
+from mmd import *
 
 app = typer.Typer()
 
-def symmetrize_adj(adj: torch.Tensor) -> torch.Tensor:
+def degree_worker(G):
+    return np.array(nx.degree_histogram(G))
+
+
+def degree_stats(graph_ref_list, graph_pred_list):
     """
-    adj: [B, N, N]
+    Compute the MMD between the degree distributions of two sets of graphs.
     """
-    adj = 0.5 * (adj + adj.transpose(1, 2))
-    return adj
 
+    sample_ref = []
+    sample_pred = []
 
-def remove_self_loops(adj: torch.Tensor) -> torch.Tensor:
-    """
-    adj: [B, N, N]
-    """
-    B, N, _ = adj.shape
-    eye = torch.eye(N, device=adj.device).unsqueeze(0)
-    return adj * (1.0 - eye)
-
-
-def threshold_samples(samples: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-    samples = symmetrize_adj(samples)
-    adj = (samples > threshold).float()
-    adj = remove_self_loops(adj)
-    adj = symmetrize_adj(adj)
-    adj = (adj > 0.5).float()
-    return adj
-
-
-def mask_adj(adj: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
-    """
-    Remove padded nodes from adjacency matrices.
-    """
-    pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
-    return adj * pair_mask.float()
-
-
-def count_upper_edges(adj: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
-    """
-    Count undirected non-self-loop edges for each graph using only valid nodes.
-
-    adj:       [B, N, N]
-    node_mask: [B, N]
-    returns:   [B]
-    """
-    _, N, _ = adj.shape
-
-    upper_mask = torch.triu(
-        torch.ones(N, N, dtype=torch.bool, device=adj.device),
-        diagonal=1,
-    )
-
-    valid_pairs = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
-    valid_upper = valid_pairs & upper_mask.unsqueeze(0)
-
-    return (adj * valid_upper.float()).sum(dim=(1, 2))
-
-def select_graphs_by_real_edge_fractions(
-    real_adj: torch.Tensor,
-    node_mask: torch.Tensor,
-    max_graphs: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Select graph indices whose real edge counts are closest to evenly spaced
-    fractions of the maximum real edge count.
-
-    Selection is based only on the real graphs. The sampled graphs are then
-    plotted using the same selected indices.
-    """
-    real_edge_counts = count_upper_edges(real_adj, node_mask)
-    num_available = real_edge_counts.numel()
-    num_selected = min(max_graphs, num_available)
-
-    max_edges = real_edge_counts.max().clamp(min=1.0)
-    target_fractions = torch.arange(
-        1,
-        num_selected + 1,
-        device=real_edge_counts.device,
-        dtype=torch.float,
-    ) / float(num_selected)
-
-    target_fractions[0] = 0.0
-    target_fractions[-1] = 1.0
-    target_edges = target_fractions * max_edges
-
-    selected_indices: list[int] = []
-    available_indices = set(range(num_available))
-
-    for target in target_edges:
-        best_idx = min(
-            available_indices,
-            key=lambda idx: abs(float(real_edge_counts[idx].item()) - float(target.item())),
-        )
-        selected_indices.append(best_idx)
-        available_indices.remove(best_idx)
-
-    selected_indices_tensor = torch.tensor(
-        selected_indices,
-        device=real_edge_counts.device,
-        dtype=torch.long,
-    )
-
-    return selected_indices_tensor, target_edges, real_edge_counts
-
-
-def dense_adj_to_nx(adj: torch.Tensor, node_mask: torch.Tensor | None = None) -> nx.Graph:
-    """
-    Convert one dense adjacency matrix to a NetworkX graph.
-    """
-    adj = adj.detach().cpu()
-
-    if node_mask is not None:
-        node_mask = node_mask.detach().cpu().bool()
-        valid_idx = torch.where(node_mask)[0]
-        adj = adj[valid_idx][:, valid_idx]
-
-    adj = (adj > 0.5).int().numpy()
-
-    G = nx.from_numpy_array(adj)
-    G.remove_edges_from(nx.selfloop_edges(G))
-    return G
-
-
-def graph_statistics(adj: torch.Tensor, node_mask: torch.Tensor) -> pd.DataFrame:
-    """
-    Compute graph-level statistics for a batch of dense adjacency matrices.
-
-    adj:       [B, N, N]
-    node_mask: [B, N]
-    """
-    rows = []
-
-    B = adj.size(0)
-
-    for i in range(B):
-        G = dense_adj_to_nx(adj[i], node_mask[i])
-
-        num_nodes = G.number_of_nodes()
-        num_edges = G.number_of_edges()
-
-        if num_nodes > 1:
-            density = nx.density(G)
-        else:
-            density = 0.0
-
-        degrees = [deg for _, deg in G.degree()]
-        avg_degree = float(sum(degrees) / max(len(degrees), 1))
-        max_degree = float(max(degrees)) if degrees else 0.0
-
-        if num_nodes > 0:
-            avg_clustering = nx.average_clustering(G)
-        else:
-            avg_clustering = 0.0
-
-        num_components = nx.number_connected_components(G) if num_nodes > 0 else 0
-        largest_component = max((len(c) for c in nx.connected_components(G)), default=0)
-
-        rows.append(
-            {
-                "graph_idx": i,
-                "num_nodes": num_nodes,
-                "num_edges": num_edges,
-                "density": density,
-                "avg_degree": avg_degree,
-                "max_degree": max_degree,
-                "avg_clustering": avg_clustering,
-                "num_components": num_components,
-                "largest_component": largest_component,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-def summarize_stats(real_stats: pd.DataFrame, sample_stats: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compare mean graph statistics between real and sampled graphs.
-    """
-    metric_cols = [
-        "num_nodes",
-        "num_edges",
-        "density",
-        "avg_degree",
-        "max_degree",
-        "avg_clustering",
-        "num_components",
-        "largest_component",
+    # Remove empty generated graphs
+    graph_pred_list = [
+        G for G in graph_pred_list
+        if G.number_of_nodes() > 0
     ]
 
-    rows = []
+    for G in graph_ref_list:
+        sample_ref.append(degree_worker(G))
 
-    for metric in metric_cols:
-        real_mean = real_stats[metric].mean()
-        sample_mean = sample_stats[metric].mean()
+    for G in graph_pred_list:
+        sample_pred.append(degree_worker(G))
 
-        rows.append(
-            {
-                "metric": metric,
-                "real_mean": real_mean,
-                "sample_mean": sample_mean,
-                "absolute_difference": abs(real_mean - sample_mean),
-            }
+    return compute_mmd(
+        sample_ref,
+        sample_pred,
+        kernel=gaussian_emd,
+    )
+
+
+###############################################################################
+
+
+def spectral_worker(G):
+    """
+    Compute the normalized Laplacian spectrum histogram.
+    """
+
+    eigs = eigvalsh(
+        nx.normalized_laplacian_matrix(G).todense()
+    )
+
+    spectral_hist, _ = np.histogram(
+        eigs,
+        bins=200,
+        range=(-1e-5, 2),
+        density=False,
+    )
+
+    spectral_hist = spectral_hist.astype(np.float64)
+
+    if spectral_hist.sum() > 0:
+        spectral_hist /= spectral_hist.sum()
+
+    return spectral_hist
+
+
+def spectral_stats(graph_ref_list, graph_pred_list):
+    """
+    Compute MMD between graph spectra.
+    """
+
+    sample_ref = []
+    sample_pred = []
+
+    graph_pred_list = [
+        G for G in graph_pred_list
+        if G.number_of_nodes() > 0
+    ]
+
+    for G in graph_ref_list:
+        sample_ref.append(spectral_worker(G))
+
+    for G in graph_pred_list:
+        sample_pred.append(spectral_worker(G))
+
+    return compute_mmd(
+        sample_ref,
+        sample_pred,
+        kernel=gaussian_emd,
+    )
+
+
+###############################################################################
+
+
+def clustering_worker(G, bins=100):
+    clustering_coeffs = list(nx.clustering(G).values())
+
+    hist, _ = np.histogram(
+        clustering_coeffs,
+        bins=bins,
+        range=(0.0, 1.0),
+        density=False,
+    )
+
+    return hist
+
+
+def clustering_stats(graph_ref_list, graph_pred_list, bins=100):
+    """
+    Compute MMD between clustering coefficient distributions.
+    """
+
+    sample_ref = []
+    sample_pred = []
+
+    graph_pred_list = [
+        G for G in graph_pred_list
+        if G.number_of_nodes() > 0
+    ]
+
+    for G in graph_ref_list:
+        sample_ref.append(
+            clustering_worker(G, bins)
         )
 
-    return pd.DataFrame(rows)
+    for G in graph_pred_list:
+        sample_pred.append(
+            clustering_worker(G, bins)
+        )
+
+    return compute_mmd(
+        sample_ref,
+        sample_pred,
+        kernel=gaussian_emd,
+        sigma=1.0 / 10,
+        distance_scaling=bins,
+    )
+
+###############################################################################
+# ORCA / Orbit statistics
+###############################################################################
+
+motif_to_indices = {
+    "3path": [1, 2],
+    "4cycle": [8],
+}
+
+COUNT_START_STR = "orbit counts: \n"
 
 
-def plot_real_vs_sampled_batch(
-    real_adj: torch.Tensor,
-    sample_adj: torch.Tensor,
-    node_mask: torch.Tensor,
-    output_path: Path,
-    max_graphs: int = 6,
-    seed: int = 42,
+def edge_list_reindexed(G):
+    """
+    Reindex graph nodes to consecutive integers required by ORCA.
+    """
+    idx = 0
+    id2idx = {}
+
+    for u in G.nodes():
+        id2idx[str(u)] = idx
+        idx += 1
+
+    edges = []
+
+    for u, v in G.edges():
+        edges.append((id2idx[str(u)], id2idx[str(v)]))
+
+    return edges
+
+
+def orca(graph):
+    """
+    Run ORCA and return node orbit counts.
+    """
+
+    tmp_file_path = os.path.join(ORCA_DIR, "tmp.txt")
+
+    with open(tmp_file_path, "w") as f:
+        f.write(
+            f"{graph.number_of_nodes()} {graph.number_of_edges()}\n"
+        )
+
+        for u, v in edge_list_reindexed(graph):
+            f.write(f"{u} {v}\n")
+
+    orca_path = os.path.join(ORCA_DIR, "orca")
+    output = sp.check_output(
+        [
+            orca_path,
+            "node",
+            "4",
+            tmp_file_path,
+            "std",
+        ]
+    )
+
+    output = output.decode("utf8").strip()
+
+    idx = output.find(COUNT_START_STR) + len(COUNT_START_STR)
+
+    output = output[idx:]
+
+    node_orbit_counts = np.array(
+        [
+            list(map(int, line.strip().split(" ")))
+            for line in output.strip("\n").split("\n")
+        ]
+    )
+
+    try:
+        os.remove(tmp_file_path)
+    except OSError:
+        pass
+
+    return node_orbit_counts
+
+
+def orbit_stats_all(graph_ref_list, graph_pred_list):
+    """
+    Compute MMD over graph orbit count statistics.
+    """
+
+    total_counts_ref = []
+    total_counts_pred = []
+
+    for G in graph_ref_list:
+
+        try:
+            orbit_counts = orca(G)
+        except Exception:
+            continue
+
+        orbit_counts = (
+            np.sum(orbit_counts, axis=0)
+            / G.number_of_nodes()
+        )
+
+        total_counts_ref.append(orbit_counts)
+
+    for G in graph_pred_list:
+
+        try:
+            orbit_counts = orca(G)
+        except Exception:
+            continue
+
+        orbit_counts = (
+            np.sum(orbit_counts, axis=0)
+            / G.number_of_nodes()
+        )
+
+        total_counts_pred.append(orbit_counts)
+
+    total_counts_ref = np.array(total_counts_ref)
+    total_counts_pred = np.array(total_counts_pred)
+
+    return compute_mmd(
+        total_counts_ref,
+        total_counts_pred,
+        kernel=gaussian,
+        is_hist=False,
+        sigma=30.0,
+    )
+
+
+###############################################################################
+# Graph conversion
+###############################################################################
+
+
+def adjs_to_graphs(adjs, node_flags=None):
+    graph_list = []
+
+    if torch.is_tensor(adjs):
+        adjs = adjs.detach().cpu().numpy()
+
+    if node_flags is not None and torch.is_tensor(node_flags):
+        node_flags = node_flags.detach().cpu().numpy()
+
+    for i, adj in enumerate(adjs):
+
+        if node_flags is not None:
+            keep = node_flags[i].astype(bool)
+            adj = adj[np.ix_(keep, keep)]
+
+        G = nx.from_numpy_array(adj)
+
+        G.remove_edges_from(nx.selfloop_edges(G))
+
+        if G.number_of_nodes() == 0:
+            G.add_node(0)
+
+        graph_list.append(G)
+
+    return graph_list
+
+
+###############################################################################
+# Lobster evaluation
+###############################################################################
+
+
+def is_lobster_graph(G):
+    """
+    Check whether a graph is a lobster graph.
+    """
+
+    G = copy.deepcopy(G)
+
+    if not nx.is_tree(G):
+        return False
+
+    leaves = [n for n, d in G.degree() if d == 1]
+    G.remove_nodes_from(leaves)
+
+    leaves = [n for n, d in G.degree() if d == 1]
+    G.remove_nodes_from(leaves)
+
+    num_nodes = len(G.nodes())
+
+    degree_one = [d for _, d in G.degree() if d == 1]
+    degree_two = [d for _, d in G.degree() if d == 2]
+
+    if (
+        sum(degree_one) == 2
+        and sum(degree_two) == 2 * (num_nodes - 2)
+    ):
+        return True
+
+    if (
+        sum(degree_one) == 0
+        and sum(degree_two) == 0
+    ):
+        return True
+
+    return False
+
+
+def eval_acc_lobster_graph(graph_list):
+
+    graph_list = [copy.deepcopy(G) for G in graph_list]
+
+    count = 0
+
+    for G in graph_list:
+        if is_lobster_graph(G):
+            count += 1
+
+    return count / len(graph_list)
+
+###############################################################################
+# Evaluation wrappers
+###############################################################################
+
+METHOD_NAME_TO_FUNC = {
+    "degree": degree_stats,
+    "cluster": clustering_stats,
+    "orbit": orbit_stats_all,
+    "spectral": spectral_stats,
+}
+
+
+def eval_graph_list(graph_ref_list, graph_pred_list, methods=None):
+    """
+    Evaluate two lists of NetworkX graphs.
+    """
+
+    if methods is None:
+        methods = [
+            "degree",
+            "cluster",
+            "orbit",
+        ]
+
+    results = {}
+
+    for method in methods:
+        results[method] = METHOD_NAME_TO_FUNC[method](
+            graph_ref_list,
+            graph_pred_list,
+        )
+    return results
+
+
+def eval_torch_batch(
+    ref_batch,
+    pred_batch,
+    node_mask=None,
+    methods=None,
 ):
     """
-    Plot real and generated graphs side by side.
-
-    Top row: real graphs
-    Bottom row: sampled graphs
+    Evaluate batches of adjacency matrices stored as torch tensors.
     """
-    selected_indices, target_edges, real_edge_counts = select_graphs_by_real_edge_fractions(
-        real_adj=real_adj,
-        node_mask=node_mask,
-        max_graphs=max_graphs,
+
+    graph_ref_list = adjs_to_graphs(
+        ref_batch,
+        node_mask,
     )
 
-    num_graphs = selected_indices.numel()
-
-    fig, axes = plt.subplots(
-        nrows=2,
-        ncols=num_graphs,
-        figsize=(3.4 * num_graphs, 6.5),
-        squeeze=False,
+    graph_pred_list = adjs_to_graphs(
+        pred_batch,
+        node_mask,
     )
 
-    for plot_idx, graph_idx_tensor in enumerate(selected_indices):
-        graph_idx = int(graph_idx_tensor.item())
-
-        real_G = dense_adj_to_nx(real_adj[graph_idx], node_mask[graph_idx])
-        sample_G = dense_adj_to_nx(sample_adj[graph_idx], node_mask[graph_idx])
-
-        pos_real = nx.spring_layout(real_G, seed=seed)
-        pos_sample = nx.spring_layout(sample_G, seed=seed)
-
-        ax = axes[0, plot_idx]
-        nx.draw_networkx(
-            real_G,
-            pos=pos_real,
-            ax=ax,
-            node_size=45,
-            with_labels=False,
-            width=0.7,
-            alpha=0.8,
-        )
-        real_edges = real_G.number_of_edges()
-        ax.set_title(f"Real {graph_idx} | E={real_edges}")
-        ax.set_axis_off()
-
-        ax = axes[1, plot_idx]
-        nx.draw_networkx(
-            sample_G,
-            pos=pos_sample,
-            ax=ax,
-            node_size=45,
-            with_labels=False,
-            width=0.7,
-            alpha=0.8,
-        )
-        sampled_edges = sample_G.number_of_edges()
-        ax.set_title(f"Sampled {graph_idx} | E={sampled_edges}")
-        ax.set_axis_off()
-
-    fig.suptitle(
-        "Real vs sampled Cora subgraphs at increasing fractions of max real edge count",
-        fontsize=14,
+    return eval_graph_list(
+        graph_ref_list,
+        graph_pred_list,
+        methods=methods,
     )
-    fig.tight_layout()
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
 
 @app.command()
 def main(
-    data_path: Path = PROCESSED_DATA_DIR / "cora",
-    model_path: Path = MODELS_DIR / "GAT_denoiser.pt",
-    output_dir: Path = FIGURES_DIR / "sampling",
-    batch_size: int = 32,
-    max_nodes: int = 64,
-    num_samples: int = 10_000,
-    num_hops: int = 2,
-    min_nodes: int = 8,
-    threshold: float = 0.5,
-):
+        batch_size: int = 32,
+        max_nodes: int = 16,
+        num_hops: int = 3,
+        min_nodes: int = 4,
+        diffusion_steps: int = 1000,
+        hidden_dimension: int = 128,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        time_emb_dim: int = 16,
+        dropout: float = 0.1,
+        seed: int = 42,
+    ):
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    data = get_data(PROCESSED_DATA_DIR / DATASET)
 
-    logger.info("Performing inference for model...")
-
-    data = get_data(data_path)
-
-    loader = construct_dataloader(
-        data,
-        num_samples=num_samples,
+    _, _, test_loader = construct_dataloader(
+        data=data,
         num_hops=num_hops,
         max_nodes=max_nodes,
         min_nodes=min_nodes,
-        seed=0,
         batch_size=batch_size,
+        seed=seed,
         shuffle=True,
     )
 
-    diffusion = GaussianDiffusion(num_steps=1000).to(device)
-    denoiser = GAT_Denoiser(
-        max_nodes=64,
-        feature_dim=1433,
-        hidden_dim=128,
-        time_emb_dim=32,
-        num_layers=2,
-        num_heads=4,
-        dropout=0.0,
+    x_classes = data.num_node_classes
+    e_classes = data.num_edge_classes
+
+    diffusion = DiscreteDiffusion(
+        x_classes=x_classes,
+        e_classes=e_classes,
+        num_steps=diffusion_steps,
+    ).to(device)
+    
+    denoiser = TransformerDenoiser(
+        max_nodes=max_nodes,
+        x_classes=x_classes,
+        e_classes=e_classes,
+        hidden_dim=hidden_dimension,
+        time_emb_dim=time_emb_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        dropout=dropout,
+        diffusion=diffusion,
     ).to(device)
 
-    ckpt = torch.load(model_path, map_location=device)
-    denoiser.load_state_dict(ckpt)
-    denoiser.eval()
+    model_path = MODELS_DIR / "model_discrete.pt"
+    checkpoint = torch.load(model_path, map_location=device)
+    denoiser.load_state_dict(checkpoint["model_state_dict"])
 
-    batch = next(iter(loader))
-    x, real_adj, node_mask = batch_to_dense(batch, max_nodes=max_nodes)
+    batch_bar = tqdm(
+                test_loader,
+                unit="batch",
+                leave=False,
+                dynamic_ncols=True,
+            )
 
-    x = x.to(device).float()
-    real_adj = real_adj.to(device).float()
-    node_mask = node_mask.to(device)
+    all_real = []
+    all_generated = []
+    all_node_masks = []
+    for step, batch in enumerate(batch_bar, start=1):
+        with torch.no_grad():
+            denoiser.eval()
 
-    real_adj = symmetrize_adj(real_adj)
-    real_adj = remove_self_loops(real_adj)
-    real_adj = mask_adj(real_adj, node_mask)
-    real_adj = torch.maximum(real_adj, real_adj.transpose(1, 2))
+            batch = batch.to(device)
 
-    B, N, _ = real_adj.shape
+            _, x0, e0, node_mask = to_dense(
+                            x=batch.x,
+                            y=batch.y,
+                            edge_index=batch.edge_index,
+                            edge_attr=getattr(batch, "edge_attr", None),
+                            batch=batch.batch,
+                            min_nodes=min_nodes,
+                            max_nodes=max_nodes,
+                        )
 
-    logger.info(f"x shape: {x.shape}")
-    logger.info(f"real adj shape: {real_adj.shape}")
-    logger.info(f"node mask shape: {node_mask.shape}")
+            real_x = x0.to(device).long()
+            real_e = e0.to(device).long()
+            node_mask = node_mask.to(device)
 
-    with torch.no_grad():
-        samples = diffusion.sample(
-            model=denoiser,
-            x=x,
-            adj_shape=[B, N, N],
-            node_mask=node_mask,
-            device=device,
-        )
+            sampled, chain = diffusion.sample(
+                            model=denoiser,
+                            batch_size=real_x.size(0),
+                            num_nodes=real_e.size(1),
+                            keep_chain=False,
+                            node_mask=node_mask,
+                            device=device,
+                        )
+            
+            sampled_x = sampled["X"].to(device).float()
+            sampled_e = sampled["E"].to(device).float()
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # test_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-    test_thresholds = [0.5]
-    
-    for threshold in test_thresholds:
-        logger.info(f"Stastics and plot for threshold = {threshold}...")
-        sample_adj = threshold_samples(samples, threshold=threshold)
-        sample_adj = mask_adj(sample_adj, node_mask)
+            # Convert edge labels to binary adjacency matrices.
+            # Assumes edge class 0 = no edge.
+            real_adj = (real_e > 0).float()
+            sampled_adj = (sampled_e > 0).float()
+            node_mask = (node_mask > 0).float()
 
-        logger.debug(f"Real adjacency matrix: \n{real_adj.detach()[0, :3, :3]}")
-        logger.debug(f"Sampled adjacency matrix: \n{sample_adj.detach()[0, :3, :3]}")
+            all_real.extend(real_adj)
+            all_generated.extend(sampled_adj)
+            all_node_masks.extend(node_mask)
 
-        real_stats = graph_statistics(real_adj, node_mask)
-        sample_stats = graph_statistics(sample_adj, node_mask)
-        summary = summarize_stats(real_stats, sample_stats)
-
-        threshold_tag = str(threshold).replace(".", "_")
-        real_stats_path = output_dir / f"real_graph_stats_threshold_{threshold_tag}.csv"
-        sample_stats_path = output_dir / f"sampled_graph_stats_threshold_{threshold_tag}.csv"
-        summary_path = output_dir / f"real_vs_sampled_summary_threshold_{threshold_tag}.csv"
-        figure_path = output_dir / f"real_vs_sampled_batch_threshold_{threshold_tag}.png"
-
-        plot_real_vs_sampled_batch(
-            real_adj=real_adj,
-            sample_adj=sample_adj,
-            node_mask=node_mask,
-            output_path=figure_path,
-            max_graphs=6,
-        )
-
-        logger.info(f"\n{summary}")
-
-        logger.success(f"Saved real stats to {real_stats_path}")
-        logger.success(f"Saved sampled stats to {sample_stats_path}")
-        logger.success(f"Saved summary to {summary_path}")
-        logger.success(f"Saved visualization to {figure_path}")
-        logger.success("Inference complete.")
+    all_real = np.array(all_real)
+    all_generated = np.array(all_generated)
+    all_node_masks = np.array(all_node_masks)
+    metrics = eval_torch_batch(
+                    all_real,
+                    all_generated,
+                    node_mask=all_node_masks,
+                    methods=[
+                        "degree",
+                        "cluster",
+                        "spectral",
+                        "orbit",
+                    ],
+                )
+  
+    for name, value in metrics.items():
+        print(f"{name}: {value:.6f}")
 
 if __name__ == "__main__":
     app()
