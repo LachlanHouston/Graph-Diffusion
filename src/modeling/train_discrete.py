@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from loguru import logger
+import matplotlib.pyplot as plt
 import numpy as np
 import random
 from tqdm import tqdm
@@ -10,19 +11,44 @@ import torch
 import torch.nn.functional as F
 import wandb
 
-from src.config import MODELS_DIR, PROCESSED_DATA_DIR
+from src.config import MODELS_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR
 from src.dataset_ego import (
-    get_data,
-    construct_dataloader,
-    to_dense,
-    DATASET,
+    BASE_EGO_DATASET,
+    EGO_DATASET,
+    construct_ego_dataloader,
+    get_ego_data,
 )
+
+from src.dataset_community import (
+    COMMUNINTY_DATASET,
+    construct_community_dataloader,
+    get_community_data,
+)
+
+from src.data_utils import to_dense
 from src.modeling.model_discrete import DiscreteDiffusion, TransformerDenoiser, sample_timesteps
-from src.plots import make_sample_figure
 from src.modeling.predict import eval_torch_batch
-from src.modeling.utils import masked_upper_edge_cross_entropy, masked_node_cross_entropy
+from src.modeling.utils import masked_upper_edge_cross_entropy, masked_node_cross_entropy, make_sample_figure
 
 app = typer.Typer()
+
+DATASET = "community"
+
+if DATASET == "ego":
+    DATASET_NAME = EGO_DATASET
+    BASE_DATASET = BASE_EGO_DATASET
+
+    get_data = get_ego_data
+    construct_dataloader = construct_ego_dataloader
+    max_nodes = 18
+
+elif DATASET == "community":
+    DATASET_NAME = COMMUNINTY_DATASET
+    BASE_DATASET = "Community-small"
+
+    get_data = get_community_data
+    construct_dataloader = construct_community_dataloader
+    max_nodes = 20
 
 @app.command()
 def main(
@@ -30,10 +56,10 @@ def main(
     max_epochs: int = 1000,
     batch_size: int = 32,
     min_nodes: int = 1,
-    max_nodes: int = 18,
-    num_hops: int = 3,
+    num_hops: int = 2,
     diffusion_steps: int = 1000,
-    hidden_dimension: int = 128,
+    hidden_dimension: int = 64,
+    feature_hidden_dim: int = 16,
     num_layers: int = 2,
     num_heads: int = 4,
     time_emb_dim: int = 16,
@@ -42,14 +68,19 @@ def main(
     x_loss_scale: float = 1.0,
     wandb_project: str = "graph-diffusion",
     wandb_entity: str | None = None,
-    wandb_run_name: str = "local_ego_run",
+    wandb_run_name: str | None = None,
     wandb_mode: str = "online",
     wandb_log_interval: int = 10,
     seed: int = 42,
     val_seed: int = 0,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    data = get_data(PROCESSED_DATA_DIR / DATASET)
+    if DATASET == "ego":
+        DEFAULT_INPUT = PROCESSED_DATA_DIR / DATASET_NAME
+    else:
+        DEFAULT_INPUT = PROCESSED_DATA_DIR / "Community" / "community_small.pkl"
+
+    data = get_data(path=DEFAULT_INPUT)
 
     random.seed(seed)
     torch.manual_seed(seed)
@@ -57,12 +88,15 @@ def main(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    train_loader, val_loader, test_loader = construct_dataloader(
+    train_loader, val_loader, test_loader, node_marginals, edge_marginals = construct_dataloader(
         data=data,
         seed=seed,
         batch_size=batch_size,
         shuffle=True,
     )
+
+    if wandb_run_name is None:
+        wandb_run_name = f"{DATASET}_discrete_run"
 
     wandb.init(
         project=wandb_project,
@@ -73,6 +107,7 @@ def main(
 
     x_classes = data.num_node_classes
     e_classes = data.num_edge_classes
+    f_shape = data.num_node_features
 
     logger.info(
         f"Training discrete diffusion model with x_classes={x_classes}, e_classes={e_classes}."
@@ -82,13 +117,17 @@ def main(
         x_classes=x_classes,
         e_classes=e_classes,
         num_steps=diffusion_steps,
+        node_marginals=node_marginals,
+        edge_marginals=edge_marginals,
     ).to(device)
 
     denoiser = TransformerDenoiser(
         max_nodes=max_nodes,
+        feature_dim=f_shape,
         x_classes=x_classes,
         e_classes=e_classes,
         hidden_dim=hidden_dimension,
+        feature_hidden_dim=feature_hidden_dim,
         time_emb_dim=time_emb_dim,
         num_layers=num_layers,
         num_heads=num_heads,
@@ -138,7 +177,7 @@ def main(
         for step, batch in enumerate(batch_bar, start=1):
             batch = batch.to(device)
 
-            _, x0, e0, node_mask = to_dense(
+            f0, x0, e0, node_mask = to_dense(
                 x=batch.x,
                 y=batch.y,
                 edge_index=batch.edge_index,
@@ -148,6 +187,7 @@ def main(
                 max_nodes=max_nodes,
             )
 
+            f0 = f0.to(device).float()
             x0 = x0.to(device).long()
             e0 = e0.to(device).long()
             node_mask = node_mask.to(device)
@@ -166,6 +206,7 @@ def main(
             )
 
             pred = denoiser(
+                features=f0,
                 x=noised["X_t"],
                 adj_noisy=noised["E_t"],
                 t=t,
@@ -280,7 +321,7 @@ def main(
                 for step, batch in enumerate(val_batch_bar, start=1):
                     batch = batch.to(device)
 
-                    _, x0, e0, node_mask = to_dense(
+                    f0, x0, e0, node_mask = to_dense(
                         x=batch.x,
                         y=batch.y,
                         edge_index=batch.edge_index,
@@ -290,6 +331,7 @@ def main(
                         max_nodes=max_nodes,
                     )
 
+                    f0 = f0.to(device).float()
                     x0 = x0.to(device).long()
                     e0 = e0.to(device).long()
                     node_mask = node_mask.to(device)
@@ -308,6 +350,7 @@ def main(
                     )
 
                     pred = denoiser(
+                        features=f0,
                         x=noised["X_t"],
                         adj_noisy=noised["E_t"],
                         t=t,
@@ -369,6 +412,14 @@ def main(
             step=global_step,
         )
 
+        scheduler.step()
+        wandb.log(
+            {
+                "train/learning_rate": optimizer.param_groups[0]["lr"],
+            },
+            step=global_step,
+        )
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             run_val_stats = True
@@ -397,15 +448,10 @@ def main(
                 },
             }
 
-            torch.save(checkpoint, MODELS_DIR / model_prefix)
+            best_val_path: Path = MODELS_DIR / DATASET_NAME / model_prefix
+            best_val_path.parent.mkdir(parents=True, exist_ok=True)
 
-        scheduler.step()
-        wandb.log(
-            {
-                "train/learning_rate": optimizer.param_groups[0]["lr"],
-            },
-            step=global_step,
-        )
+            torch.save(checkpoint, best_val_path)
 
         if run_val_stats:
             batch_bar = tqdm(
@@ -427,80 +473,91 @@ def main(
                 if device == "cuda":
                     torch.cuda.manual_seed_all(val_seed)
 
-            with torch.no_grad():
-                denoiser.eval()
-                for step, batch in enumerate(batch_bar, start=1):
-                        batch = batch.to(device)
-            
-                        _, x0, e0, node_mask = to_dense(
-                                        x=batch.x,
-                                        y=batch.y,
-                                        edge_index=batch.edge_index,
-                                        edge_attr=getattr(batch, "edge_attr", None),
-                                        batch=batch.batch,
-                                        min_nodes=min_nodes,
-                                        max_nodes=max_nodes,
-                                    )
-                        real_x = x0.to(device).long()
-                        real_e = e0.to(device).long()
-                        node_mask = node_mask.to(device)
-            
-                        sampled, _ = diffusion.sample(
-                                        model=denoiser,
-                                        batch_size=real_e.size(0),
-                                        num_nodes=real_e.size(1),
-                                        keep_chain=False,
-                                        node_mask=node_mask,
-                                        device=device,
-                                    )
-
-                        sampled_x = sampled["X"].to(device).float()
-                        sampled_e = sampled["E"].to(device).float()
-            
-                        real_adj = (real_e > 0).float()
-                        sampled_adj = (sampled_e > 0).float()
-                        node_mask = (node_mask > 0).float()
-            
-                        all_real.append(real_adj.detach().cpu())
-                        all_generated.append(sampled_adj.detach().cpu())
-                        all_node_masks.append(node_mask.detach().cpu())
-            
-                all_real = torch.cat(all_real, dim=0)
-                all_generated = torch.cat(all_generated, dim=0)
-                all_node_masks = torch.cat(all_node_masks, dim=0)
-                metrics = eval_torch_batch(
-                                all_real,
-                                all_generated,
-                                node_mask=all_node_masks,
-                                methods=[
-                                    "degree",
-                                    "cluster",
-                                    "spectral",
-                                ],
-                            )
+                with torch.no_grad():
+                    denoiser.eval()
+                    for step, batch in enumerate(batch_bar, start=1):
+                            batch = batch.to(device)
                 
-                graph_log = {
-                    f"validation_graphs/{name}_mmd": value
-                    for name, value in metrics.items()
-                }
-                graph_log["validation_graphs/epoch"] = epoch
-                wandb.log(graph_log, step=global_step)
+                            f0, x0, e0, node_mask = to_dense(
+                                            x=batch.x,
+                                            y=batch.y,
+                                            edge_index=batch.edge_index,
+                                            edge_attr=getattr(batch, "edge_attr", None),
+                                            batch=batch.batch,
+                                            min_nodes=min_nodes,
+                                            max_nodes=max_nodes,
+                                        )
+                            
+                            f0 = f0.to(device).float()
+                            real_x = x0.to(device).long()
+                            real_e = e0.to(device).long()
+                            node_mask = node_mask.to(device)
+                
+                            sampled, _ = diffusion.sample(
+                                            model=denoiser,
+                                            features=f0,
+                                            batch_size=real_e.size(0),
+                                            num_nodes=real_e.size(1),
+                                            keep_chain=False,
+                                            node_mask=node_mask,
+                                            device=device,
+                                        )
 
-                fig = make_sample_figure(
-                        real_x=real_x,
-                        real_e=real_e,
-                        sampled_x=sampled_x,
-                        sampled_e=sampled_e,
-                        node_mask=node_mask,
-                        num_graphs=6,
+                            sampled_x = sampled["X"].to(device).float()
+                            sampled_e = sampled["E"].to(device).float()
+                
+                            real_adj = (real_e > 0).float()
+                            sampled_adj = (sampled_e > 0).float()
+                            node_mask = (node_mask > 0).float()
+                
+                            all_real.append(real_adj.detach().cpu())
+                            all_generated.append(sampled_adj.detach().cpu())
+                            all_node_masks.append(node_mask.detach().cpu())
+
+                            if step == 1:
+                                plot_real_x = real_x
+                                plot_real_e = real_e
+                                plot_sampled_x = sampled_x
+                                plot_sampled_e = sampled_e
+                                plot_node_mask = node_mask 
+                
+                    all_real = torch.cat(all_real, dim=0)
+                    all_generated = torch.cat(all_generated, dim=0)
+                    all_node_masks = torch.cat(all_node_masks, dim=0)
+                    metrics = eval_torch_batch(
+                                    all_real,
+                                    all_generated,
+                                    node_mask=all_node_masks,
+                                    methods=[
+                                        "degree",
+                                        "cluster",
+                                        "spectral",
+                                    ],
+                                )
+                    
+                    graph_log = {
+                        f"validation_graphs/{name}_mmd": value
+                        for name, value in metrics.items()
+                    }
+                    graph_log["validation_graphs/epoch"] = epoch
+                    wandb.log(graph_log, step=global_step)
+
+                    fig = make_sample_figure(
+                            real_x=plot_real_x,
+                            real_e=plot_real_e,
+                            sampled_x=plot_sampled_x,
+                            sampled_e=plot_sampled_e,
+                            node_mask=plot_node_mask,
+                            num_graphs=6,
+                        )
+
+                    image = wandb.Image(
+                        fig,
+                        caption=f"Epoch {epoch}",
                     )
-
-                image = wandb.Image(
-                    fig,
-                    caption=f"Epoch {epoch}",
-                )
-                
-                wandb.log({"validation_graphs/sampled": image})
+                    
+                    wandb.log({"validation_graphs/sampled": image})
+                    plt.close(fig)
 
     last_checkpoint = {
         "epoch": epoch,
@@ -526,9 +583,12 @@ def main(
         },
     }
 
+    last_model_path: Path = MODELS_DIR / DATASET_NAME / f"last_{model_prefix}"
+    last_model_path.parent.mkdir(parents=True, exist_ok=True)
+
     torch.save(
         last_checkpoint,
-        MODELS_DIR / f"last_{model_prefix}",
+        last_model_path,
     )
 
     logger.success("Discrete diffusion training complete.")

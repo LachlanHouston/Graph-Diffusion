@@ -73,6 +73,8 @@ class DiscreteDiffusion(nn.Module):
         num_steps: int = 1000,
         beta_start: float = 1e-4,
         beta_end: float = 0.02,
+        node_marginals: Tensor | None = None,
+        edge_marginals: Tensor | None = None,
     ):
         super().__init__()
 
@@ -89,13 +91,59 @@ class DiscreteDiffusion(nn.Module):
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
+        if node_marginals is None:
+            node_marginals = torch.full(
+                (x_classes,),
+                1.0 / x_classes,
+                dtype=torch.float,
+            )
+        else:
+            node_marginals = node_marginals.detach().float().clone()
+
+        if edge_marginals is None:
+            edge_marginals = torch.full(
+                (e_classes,),
+                1.0 / e_classes,
+                dtype=torch.float,
+            )
+        else:
+            edge_marginals = edge_marginals.detach().float().clone()
+
+        if node_marginals.shape != (x_classes,):
+            raise ValueError(
+                f"node_marginals must have shape ({x_classes},), "
+                f"got {tuple(node_marginals.shape)}."
+            )
+
+        if edge_marginals.shape != (e_classes,):
+            raise ValueError(
+                f"edge_marginals must have shape ({e_classes},), "
+                f"got {tuple(edge_marginals.shape)}."
+            )
+
+        if (node_marginals < 0).any():
+            raise ValueError("node_marginals cannot contain negative values.")
+
+        if (edge_marginals < 0).any():
+            raise ValueError("edge_marginals cannot contain negative values.")
+
+        if node_marginals.sum() <= 0:
+            raise ValueError("node_marginals must sum to a positive value.")
+
+        if edge_marginals.sum() <= 0:
+            raise ValueError("edge_marginals must sum to a positive value.")
+
+        node_marginals = node_marginals / node_marginals.sum()
+        edge_marginals = edge_marginals / edge_marginals.sum()
+
         self.register_buffer(
             "u_x",
-            torch.full((x_classes,), 1.0 / x_classes),
+            node_marginals,
         )
+
         self.register_buffer(
             "u_e",
-            torch.full((e_classes,), 1.0 / e_classes),
+            edge_marginals,
         )
 
         self.register_buffer("eye_x", torch.eye(x_classes).unsqueeze(0))
@@ -267,6 +315,7 @@ class DiscreteDiffusion(nn.Module):
     def p_sample_step(
         self,
         model: nn.Module,
+        features: Tensor,
         x_t: Tensor,
         e_t: Tensor,
         t: Tensor,
@@ -275,6 +324,7 @@ class DiscreteDiffusion(nn.Module):
         node_mask = self._normalize_node_mask(node_mask, x_t.device)
 
         logits = model(
+            features=features,
             x=x_t,
             adj_noisy=e_t,
             t=t,
@@ -433,6 +483,7 @@ class DiscreteDiffusion(nn.Module):
     def sample(
         self,
         model: nn.Module,
+        features: Tensor,
         batch_size: int,
         num_nodes: int,
         keep_chain: bool = False,
@@ -447,6 +498,22 @@ class DiscreteDiffusion(nn.Module):
         node_mask = self._normalize_node_mask(node_mask, device)
 
         expected_shape = (batch_size, num_nodes)
+        expected_feature_shape = (
+            batch_size,
+            num_nodes,
+            model.feature_dim,
+        )
+
+        if features.shape != expected_feature_shape:
+            raise ValueError(
+                f"features must have shape {expected_feature_shape}, "
+                f"got {tuple(features.shape)}."
+            )
+
+        features = features.to(
+            device=device,
+            dtype=torch.float,
+        )
 
         if node_mask is not None and node_mask.shape != expected_shape:
             raise ValueError(
@@ -492,6 +559,7 @@ class DiscreteDiffusion(nn.Module):
 
             x_t, e_t = self.p_sample_step(
                 model=model,
+                features=features,
                 x_t=x_t,
                 e_t=e_t,
                 t=t,
@@ -643,10 +711,11 @@ class TransformerDenoiser(nn.Module):
     def __init__(
         self,
         max_nodes: int = 64,
-        feature_dim: int = 3703,
+        feature_dim: int = 4,
         x_classes: int = 6,
         e_classes: int = 2,
         hidden_dim: int = 128,
+        feature_hidden_dim: int = 16,
         time_emb_dim: int = 32,
         num_layers: int = 2,
         num_heads: int = 4,
@@ -664,6 +733,7 @@ class TransformerDenoiser(nn.Module):
         self.x_classes = x_classes
         self.e_classes = e_classes
         self.hidden_dim = hidden_dim
+        self.feature_hidden_dim = feature_hidden_dim
         self.time_emb_dim = time_emb_dim
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -679,8 +749,15 @@ class TransformerDenoiser(nn.Module):
 
         self.node_embedding = nn.Embedding(x_classes, hidden_dim)
 
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(feature_dim, feature_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
+            nn.Linear(feature_hidden_dim, feature_hidden_dim),
+        )
+
         self.node_input_proj = nn.Sequential(
-            nn.Linear(hidden_dim + time_emb_dim, hidden_dim),
+            nn.Linear(feature_hidden_dim + hidden_dim + time_emb_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
@@ -724,6 +801,7 @@ class TransformerDenoiser(nn.Module):
 
     def encode_nodes(
         self,
+        features: Tensor,
         x: Tensor,
         adj_noisy: Tensor,
         t: Tensor,
@@ -731,18 +809,48 @@ class TransformerDenoiser(nn.Module):
     ) -> Tensor:
         B, N = x.shape
 
+        if features.shape[:2] != (B, N):
+            raise ValueError(
+                f"features must have shape [B, N, F] with B={B} and N={N}, "
+                f"got {tuple(features.shape)}."
+            )
+
+        if features.size(-1) != self.feature_dim:
+            raise ValueError(
+                f"Expected feature dimension {self.feature_dim}, "
+                f"got {features.size(-1)}."
+            )
+
         if node_mask is not None:
             node_mask = node_mask.to(
                 device=x.device,
                 dtype=torch.bool,
             )
 
+        features = features.to(
+            device=x.device,
+            dtype=torch.float,
+        )
+
+        feature_embed = self.feature_encoder(features)
         class_embed = self.node_embedding(x)
 
         t_emb = self.get_time_embedding(t)
-        t_node = t_emb[:, None, :].expand(B, N, self.time_emb_dim)
+        t_node = t_emb[:, None, :].expand(
+            B,
+            N,
+            self.time_emb_dim,
+        )
 
-        h = torch.cat([class_embed, t_node], dim=-1)
+        h = torch.cat(
+            [
+                feature_embed,
+                class_embed,
+                t_node,
+            ],
+            dim=-1,
+        )
+
         h = self.node_input_proj(h)
 
         if node_mask is not None:
@@ -819,12 +927,14 @@ class TransformerDenoiser(nn.Module):
 
     def forward(
         self,
+        features: Tensor,
         x: Tensor,
         adj_noisy: Tensor,
         t: Tensor,
         node_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         h = self.encode_nodes(
+            features=features,
             x=x,
             adj_noisy=adj_noisy,
             t=t,
@@ -913,6 +1023,7 @@ def main():
     ).to(device)
 
     logits = model(
+        features=f,
         x=noised["X_t"],
         adj_noisy=noised["E_t"],
         t=t,
@@ -921,6 +1032,7 @@ def main():
 
     sampled, chain = diffusion.sample(
         model=model,
+        features=f,
         batch_size=B,
         num_nodes=N,
         keep_chain=True,

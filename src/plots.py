@@ -17,37 +17,60 @@ import tempfile
 from sklearn.manifold import TSNE
 import seaborn as sns
 
-from src.config import FIGURES_DIR, PROCESSED_DATA_DIR
-from src.dataset_discrete import get_data, to_dense, construct_dataloader, DATASET
-from src.modeling.utils import graph_from_adjacency, evaluate_generated_graphs, binarize_samples, apply_node_mask
+from src.config import FIGURES_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR
+from src.dataset_ego import (
+    BASE_EGO_DATASET,
+    EGO_DATASET,
+    construct_ego_dataloader,
+    get_ego_data,
+)
+
+from src.dataset_community import (
+    COMMUNINTY_DATASET,
+    construct_community_dataloader,
+    get_community_data,
+)
+
+from src.data_utils import to_dense
 
 app = typer.Typer()
 
-CORA_LABEL_NAMES = {
-    0: "Theory",
-    1: "Reinforcement Learning",
-    2: "Genetic Algorithms",
-    3: "Neural Networks",
-    4: "Probabilistic Methods",
-    5: "Case Based",
-    6: "Rule Learning",
-}
-
-PUBMED_LABEL_NAMES = {
-    0: "Diabetes Mellitus, Experimental",
-    1: "Diabetes Mellitus, Type 1",
-    2: "Diabetes Mellitus, Type 2",
+CITESEER_LABEL_NAMES = {
+    0: "Agents",
+    1: "Artificial Intelligence",
+    2: "Databases",
+    3: "Information Retrieval",
+    4: "Machine Learning",
+    5: "Human-Computer Interaction",
 }
 
 
 LABEL_NAMES_BY_DATASET = {
-    "Cora": CORA_LABEL_NAMES,
-    "PubMed": PUBMED_LABEL_NAMES,
+    "Citeseer": CITESEER_LABEL_NAMES,
+    "Community-small": {},
 }
 
+DATASET = "community"
 
-def label_names() -> dict[int, str]:
-    return LABEL_NAMES_BY_DATASET.get(DATASET, {})
+if DATASET == "ego":
+    DATASET_NAME = EGO_DATASET
+    BASE_DATASET = BASE_EGO_DATASET
+
+    get_data = get_ego_data
+    construct_dataloader = construct_ego_dataloader
+
+elif DATASET == "community":
+    DATASET_NAME = COMMUNINTY_DATASET
+    BASE_DATASET = "Community-small"
+
+    get_data = get_community_data
+    construct_dataloader = construct_community_dataloader
+
+else:
+    raise ValueError(f"Unknown dataset: {DATASET}")
+
+def label_names():
+    return LABEL_NAMES_BY_DATASET.get(BASE_DATASET, {})
 
 
 def label_color(label: int):
@@ -86,21 +109,21 @@ def draw_subgraph(ax: plt.Axes, graph: Data, graph_idx: int, seed: int = 42) -> 
         nx_graph,
         pos=pos,
         ax=ax,
-        alpha=0.35,
-        width=0.8,
+        alpha=0.7,
+        width=1.6,
     )
 
     nx.draw_networkx_nodes(
         nx_graph,
         pos=pos,
         ax=ax,
-        node_size=55,
+        node_size=160,
         node_color=node_colors,
-        linewidths=0.4,
+        linewidths=1.0,
         edgecolors="black",
     )
 
-    ax.set_title(graph_title(graph, graph_idx), fontsize=9)
+    # ax.set_title(graph_title(graph, graph_idx), fontsize=16)
     ax.set_axis_off()
 
 
@@ -146,85 +169,35 @@ def crop_graph(data: Data, max_nodes: int) -> Data:
     )
 
 
-def dense_from_loader_output(batch: Batch | Data, min_nodes: int, max_nodes: int):
-    if hasattr(batch, "batch") and batch.batch is not None:
-        return to_dense(batch.x, batch.edge_index, batch.edge_attr, batch.batch, min_nodes=min_nodes, max_nodes=max_nodes)
+def dense_from_loader_output(
+    batch: Batch | Data,
+    min_nodes: int,
+    max_nodes: int | None,
+):
+    if not hasattr(batch, "batch") or batch.batch is None:
+        batch.batch = torch.zeros(
+            batch.num_nodes,
+            dtype=torch.long,
+            device=batch.x.device,
+        )
 
-    graph = Data(
+    return to_dense(
         x=batch.x,
+        y=batch.y,
         edge_index=batch.edge_index,
-        y=batch.y if hasattr(batch, "y") else None,
-        num_nodes=batch.num_nodes,
+        edge_attr=getattr(batch, "edge_attr", None),
+        batch=batch.batch,
+        min_nodes=min_nodes,
+        max_nodes=max_nodes,
     )
-    graph = crop_graph(graph, max_nodes=max_nodes)
-    graph.batch = torch.zeros(graph.num_nodes, dtype=torch.long, device=graph.x.device)
-
-    return to_dense(graph.x, max_nodes=max_nodes, batch_size=1)
-
-
-def dense_graph_from_adj(adj: torch.Tensor, node_mask: torch.Tensor) -> nx.Graph:
-    valid_nodes = torch.where(node_mask.detach().cpu().bool())[0]
-    adj = adj.detach().cpu()[valid_nodes][:, valid_nodes]
-    adj = (adj > 0.5).int().numpy()
-
-    graph = nx.from_numpy_array(adj)
-    graph.remove_edges_from(nx.selfloop_edges(graph))
-    return graph
-
-
-def visualize_dense_batch(
-    adj: torch.Tensor,
-    node_mask: torch.Tensor,
-    output_path: Path,
-    max_graphs: int = 9,
-    seed: int = 42,
-) -> None:
-    num_graphs = min(max_graphs, adj.size(0))
-
-    ncols = min(3, num_graphs)
-    nrows = (num_graphs + ncols - 1) // ncols
-
-    fig, axes = plt.subplots(
-        nrows=nrows,
-        ncols=ncols,
-        figsize=(4.2 * ncols, 3.8 * nrows),
-        squeeze=False,
-    )
-
-    flat_axes = axes.ravel()
-
-    for graph_idx in range(num_graphs):
-        graph = dense_graph_from_adj(adj[graph_idx], node_mask[graph_idx])
-        pos = nx.spring_layout(graph, k=0.25, seed=seed)
-
-        ax = flat_axes[graph_idx]
-        nx.draw_networkx_edges(graph, pos=pos, ax=ax, alpha=0.35, width=0.8)
-        nx.draw_networkx_nodes(
-            graph,
-            pos=pos,
-            ax=ax,
-            node_size=55,
-            linewidths=0.4,
-            edgecolors="black",
-        )
-        ax.set_title(
-            f"Dense {graph_idx + 1} | nodes={graph.number_of_nodes()}, edges={graph.number_of_edges()}",
-            fontsize=9,
-        )
-        ax.set_axis_off()
-
-    for ax in flat_axes[num_graphs:]:
-        ax.set_axis_off()
-
-    fig.suptitle(f"{DATASET} after batch_to_dense", fontsize=14)
-    fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.96))
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
 
 def add_label_legend(fig: plt.Figure, batch: Batch | Data) -> None:
     if not hasattr(batch, "y") or batch.y is None:
+        return
+
+    labels_present = sorted(batch.y.detach().cpu().unique().tolist())
+
+    if len(labels_present) <= 1:
         return
 
     labels_present = sorted(batch.y.detach().cpu().unique().tolist())
@@ -243,7 +216,7 @@ def add_label_legend(fig: plt.Figure, batch: Batch | Data) -> None:
                 linestyle="",
                 markerfacecolor=label_color(label_int),
                 markeredgecolor="black",
-                markersize=7,
+                markersize=20,
                 label=f"{label_int}: {label_name}",
             )
         )
@@ -253,8 +226,8 @@ def add_label_legend(fig: plt.Figure, batch: Batch | Data) -> None:
         title=f"{DATASET} paper class",
         loc="lower center",
         ncol=max(1, len(handles)),
-        fontsize=8,
-        title_fontsize=9,
+        fontsize=16,
+        title_fontsize=0,
         frameon=False,
         bbox_to_anchor=(0.5, -0.02),
     )
@@ -278,8 +251,8 @@ def visualize_batch(
     if len(graphs) == 0:
         raise ValueError("Batch did not contain any graphs to visualize.")
 
-    ncols = min(3, len(graphs))
-    nrows = (len(graphs) + ncols - 1) // ncols
+    nrows = min(3, len(graphs))
+    ncols = (len(graphs) + nrows - 1) // nrows
 
     fig, axes = plt.subplots(
         nrows=nrows,
@@ -296,7 +269,11 @@ def visualize_batch(
     for ax in flat_axes[len(graphs):]:
         ax.set_axis_off()
 
-    fig.suptitle(f"Sampled {DATASET} subgraphs colored by paper class", fontsize=14)
+    if DATASET == "ego":
+        fig.suptitle(f"Sampled {DATASET} subgraphs colored by paper class", fontsize=64)
+    else:
+        fig.suptitle(f"Sampled {DATASET} subgraphs", fontsize=64)
+    
     if labels_in_plotted_graphs:
         plotted_labels = torch.tensor(labels_in_plotted_graphs, dtype=torch.long)
         legend_batch = Batch(y=plotted_labels)
@@ -306,371 +283,7 @@ def visualize_batch(
     fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.96))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-# Train specific plotting functions
-def node_colours_from_features(x, num_nodes: int, cmap):
-    if x is None:
-        return None
-
-    classes = x.long().flatten().tolist()
-    colours = [cmap(node_class % cmap.N) for node_class in classes]
-
-    if len(colours) != num_nodes:
-        return None
-
-    return colours
-
-
-def make_sample_figure(
-    real_e,
-    sampled_e,
-    node_mask,
-    num_graphs: int = 2,
-    real_x=None,
-    sampled_x=None,
-    show_node_labels: bool = True,
-):
-    num_graphs = min(num_graphs, real_e.size(0), sampled_e.size(0), node_mask.size(0))
-    cmap = plt.get_cmap("tab10")
-
-    fig, axes = plt.subplots(
-        nrows=2,
-        ncols=num_graphs,
-        figsize=(3.5 * num_graphs, 6.0),
-        squeeze=False,
-    )
-
-    for graph_idx in range(num_graphs):
-        real_feats, real_graph = graph_from_adjacency(
-            real_x[graph_idx] if real_x is not None else None,
-            real_e[graph_idx],
-            node_mask[graph_idx],
-        )
-        sampled_feats, sampled_graph = graph_from_adjacency(
-            sampled_x[graph_idx] if sampled_x is not None else None,
-            sampled_e[graph_idx],
-            node_mask[graph_idx],
-        )
-
-        real_pos = nx.spring_layout(real_graph, seed=42)
-        sampled_pos = nx.spring_layout(sampled_graph, seed=42)
-
-        ax = axes[0, graph_idx]
-        real_labels = None
-        if show_node_labels and real_feats is not None:
-            real_labels = {
-                node_idx: str(int(node_class))
-                for node_idx, node_class in enumerate(real_feats.long().flatten().tolist())
-            }
-        nx.draw_networkx(
-            real_graph,
-            pos=real_pos,
-            node_color=node_colours_from_features(real_feats, real_graph.number_of_nodes(), cmap),
-            ax=ax,
-            node_size=45,
-            labels=real_labels,
-            with_labels=real_labels is not None,
-            font_size=6,
-            font_color="black",
-            width=0.7,
-            alpha=0.8,
-        )
-        ax.set_title(f"Real {graph_idx} | E={real_graph.number_of_edges()}")
-        ax.set_axis_off()
-
-        ax = axes[1, graph_idx]
-        sampled_labels = None
-        if show_node_labels and sampled_feats is not None:
-            sampled_labels = {
-                node_idx: str(int(node_class))
-                for node_idx, node_class in enumerate(sampled_feats.long().flatten().tolist())
-            }
-        nx.draw_networkx(
-            sampled_graph,
-            pos=sampled_pos,
-            node_color=node_colours_from_features(sampled_feats, sampled_graph.number_of_nodes(), cmap),
-            ax=ax,
-            node_size=45,
-            labels=sampled_labels,
-            with_labels=sampled_labels is not None,
-            font_size=6,
-            font_color="black",
-            width=0.7,
-            alpha=0.8,
-        )
-        ax.set_title(f"Sampled {graph_idx} | E={sampled_graph.number_of_edges()}")
-        ax.set_axis_off()
-
-    fig.suptitle("Real vs sampled graphs during training", fontsize=14)
-    fig.tight_layout()
-    return fig
-
-
-def sample_adjacency_for_plotting(denoiser, diffusion, x, real_adj, node_mask, device):
-    B, N, _ = real_adj.shape
-
-    samples = diffusion.sample(
-        model=denoiser,
-        x=x,
-        adj_shape=[B, N, N],
-        node_mask=node_mask,
-        device=device,
-    )
-
-    if isinstance(samples, dict):
-        return samples["E"]
-
-    return samples
-
-
-@torch.no_grad()
-def log_samples(
-    wandb_mode,
-    denoiser,
-    diffusion,
-    x,
-    real_adj,
-    node_mask,
-    epoch,
-    global_step,
-    threshold,
-    num_graphs,
-    device,
-    figure_path,
-):
-    """Legacy continuous/Gaussian sample logger."""
-    was_training = denoiser.training
-    denoiser.eval()
-
-    num_graphs = min(num_graphs, x.size(0), real_adj.size(0), node_mask.size(0))
-    x = x[:num_graphs].to(device)
-    real_adj = real_adj[:num_graphs].to(device)
-    node_mask = node_mask[:num_graphs].to(device)
-
-    samples = sample_adjacency_for_plotting(
-        denoiser=denoiser,
-        diffusion=diffusion,
-        x=x,
-        real_adj=real_adj,
-        node_mask=node_mask,
-        device=device,
-    )
-
-    # sampled_adj = binarize_samples(samples, threshold=threshold)
-    sampled_adj = apply_node_mask(samples, node_mask)
-
-    metrics = evaluate_generated_graphs(
-        real_e=real_adj,
-        sampled_e=sampled_adj,
-        node_mask=node_mask,
-    )
-
-    fig = make_sample_figure(
-        real_e=real_adj,
-        sampled_e=sampled_adj,
-        node_mask=node_mask,
-        num_graphs=num_graphs,
-    )
-
-    if wandb_mode != "disabled":
-        wandb.log(
-            {
-                "samples/real_vs_sampled": wandb.Image(
-                    fig,
-                    caption=f"Epoch {epoch}, threshold={threshold}",
-                ),
-                "samples/threshold": threshold,
-                "eval/degree_mmd": metrics["degree_mmd"],
-                "eval/cluster_mmd": metrics["cluster_mmd"],
-                "eval/orbit_mmd": metrics["orbit_mmd"],
-                "eval/uniqueness": metrics["uniqueness"],
-                "eval/real_edges_mean": metrics["real_edges_mean"],
-                "eval/sampled_edges_mean": metrics["sampled_edges_mean"],
-            },
-            step=global_step,
-        )
-
-    if wandb_mode != "online":
-        figure_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(figure_path, dpi=200, bbox_inches="tight")
-
-    plt.close(fig)
-
-    if was_training:
-        denoiser.train()
-
-
-def visualize_chain(
-    chain,
-    node_mask,
-    gif_path: Path | None = None,
-    duration: int = 20,
-    wandb_mode: str = "disabled",
-    global_step: int | None = None,
-    wandb_key: str = "samples/sampling_chain",
-):
-    """Render a sampled discrete reverse chain as an in-memory GIF."""
-    x_chain = chain["X_chain"][:, 0].detach().cpu()
-    e_chain = chain["E_chain"][:, 0].detach().cpu()
-
-    node_mask = node_mask[0].detach().cpu().bool()
-    valid_nodes = torch.where(node_mask)[0]
-
-    frames = []
-    graph_pos = None
-    cmap = plt.get_cmap("tab10")
-
-    for i, (x_frame, e_frame) in enumerate(zip(x_chain, e_chain)):
-        e_frame = e_frame[valid_nodes][:, valid_nodes]
-        x_frame = x_frame[valid_nodes]
-
-        graph = nx.from_numpy_array(e_frame.int().numpy())
-        graph.remove_edges_from(nx.selfloop_edges(graph))
-        graph_pos = nx.spring_layout(graph, seed=42)
-
-        node_colors = node_colours_from_features(x_frame, graph.number_of_nodes(), cmap)
-
-        fig = plt.figure(figsize=(6, 6))
-        nx.draw_networkx(
-            graph,
-            pos=graph_pos,
-            node_color=node_colors,
-            node_size=70,
-            with_labels=False,
-            width=0.7,
-            alpha=0.9,
-        )
-        plt.title(f"Sampled graph at timestep: {i}")
-        plt.axis("off")
-
-        fig.canvas.draw()
-        frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
-        frames.append(frame)
-        plt.close(fig)
-
-    if len(frames) == 0:
-        raise ValueError("Cannot visualise an empty chain.")
-
-    frames.extend([frames[-1]] * 10)
-    gif_log_path = gif_path
-
-    if gif_path is not None:
-        gif_path.parent.mkdir(parents=True, exist_ok=True)
-        imageio.mimsave(gif_path, frames, duration=duration)
-    elif wandb_mode != "disabled":
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp_file:
-            gif_log_path = Path(tmp_file.name)
-        imageio.mimsave(gif_log_path, frames, duration=duration)
-
-    if wandb_mode != "disabled" and gif_log_path is not None:
-        wandb.log(
-            {wandb_key: wandb.Video(str(gif_log_path), format="gif")},
-            step=global_step,
-        )
-
-    gif_buffer = io.BytesIO()
-    imageio.mimsave(gif_buffer, frames, format="GIF", duration=duration)
-    gif_buffer.seek(0)
-    return gif_buffer
-
-@torch.no_grad()
-def log_discrete_samples(
-    samples,
-    real,
-    node_mask,
-    epoch,
-    global_step,
-    wandb_mode,
-    device,
-    figure_path,
-    num_graphs: int = 6,
-):  
-    num_graphs = min(num_graphs, real[1].size(0), samples["E"].size(0), node_mask.size(0))
-
-    real_x = real[0][:num_graphs].to(device).float()
-    real_e = real[1][:num_graphs].to(device).float()
-    node_mask = node_mask[:num_graphs].to(device)
-
-    sampled_x = samples["X"][:num_graphs].to(device).float()
-    sampled_e = samples["E"][:num_graphs].to(device).float()
-
-    metrics = evaluate_generated_graphs(
-        real_e=real_e,
-        sampled_e=sampled_e,
-        node_mask=node_mask,
-    )
-
-    fig = make_sample_figure(
-        real_x=real_x,
-        real_e=real_e,
-        sampled_x=sampled_x,
-        sampled_e=sampled_e,
-        node_mask=node_mask,
-        num_graphs=num_graphs,
-    )
-
-    if wandb_mode != "disabled":
-        wandb_payload = {
-            "samples/real_vs_sampled": wandb.Image(
-                fig,
-                caption=f"Epoch {epoch}",
-            ),
-        }
-
-        summary_metrics = {
-            "eval_summary/degree_mmd": metrics["degree_mmd"],
-            "eval_summary/cluster_mmd": metrics["cluster_mmd"],
-            "eval_summary/orbit_mmd": metrics["orbit_mmd"],
-            "eval_summary/uniqueness": metrics["uniqueness"],
-            "eval_summary/density_abs_error": abs(
-                metrics["sampled_density_mean"]
-                - metrics["real_density_mean"]
-            ),
-            "eval_summary/avg_degree_abs_error": abs(
-                metrics["sampled_avg_degree_mean"]
-                - metrics["real_avg_degree_mean"]
-            ),
-            "eval_summary/avg_clustering_abs_error": abs(
-                metrics["sampled_avg_clustering_mean"]
-                - metrics["real_avg_clustering_mean"]
-            ),
-            "eval_summary/num_components_abs_error": abs(
-                metrics["sampled_num_components_mean"]
-                - metrics["real_num_components_mean"]
-            ),
-            "eval_summary/largest_component_fraction_abs_error": abs(
-                metrics["sampled_largest_component_fraction_mean"]
-                - metrics["real_largest_component_fraction_mean"]
-            ),
-            "eval_summary/connected_fraction_abs_error": abs(
-                metrics["sampled_connected_fraction"]
-                - metrics["real_connected_fraction"]
-            ),
-        }
-
-        wandb_payload.update(summary_metrics)
-
-        metric_table = wandb.Table(
-            columns=["metric", "value"],
-            data=[
-                [metric_name, float(metric_value)]
-                for metric_name, metric_value in sorted(metrics.items())
-            ],
-        )
-
-        wandb_payload["eval_details/all_metrics"] = metric_table
-
-        wandb.log(
-            wandb_payload,
-            step=global_step,
-        )
-
-    else:
-        figure_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(figure_path, dpi=200, bbox_inches="tight")
-
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 def plot_tsne(
@@ -829,57 +442,58 @@ def plot_tsne(
 
 @app.command()
 def main(
-    input_path: Path = PROCESSED_DATA_DIR / DATASET,
-    output_path: Path = FIGURES_DIR / f"{DATASET}_subgraph_batch.png",
-    dense_output_path: Path = FIGURES_DIR / f"{DATASET}_dense_batch.png",
     batch_size: int = 32,
-    max_graphs: int = 16,
-    num_samples: int = 10_000,
-    num_hops: int = 3,
-    max_nodes: int = 64,
-    min_nodes: int = 8,
+    max_graphs: int = 15,
+    min_nodes: int = 4,
+    max_nodes: int = 18,
     seed: int = 0,
 ):
-    logger.info(f"Loading {DATASET} data...")
-    data = get_data(input_path)
+    logger.info(f"Loading {DATASET_NAME} data...")
 
-    logger.info("Constructing subgraph dataloader...")
+    output_path: Path = FIGURES_DIR / f"{DATASET_NAME}_subgraph_batch.png"
 
-    loader = construct_dataloader(
+    if DATASET == "ego":
+        DEFAULT_INPUT = RAW_DATA_DIR / BASE_DATASET
+    else:
+        DEFAULT_INPUT = PROCESSED_DATA_DIR / "Community" / "community_small.pkl"
+
+    if DATASET == "ego":
+        data = get_data(
+            path=DEFAULT_INPUT,
+            radius=1,
+            min_nodes=min_nodes,
+            max_nodes=max_nodes,
+            num_graphs=200,
+        )
+    else:
+        data = get_data(path=DEFAULT_INPUT)
+
+    logger.info("Constructing dataloaders...")
+
+    train_loader, _, _, _, _ = construct_dataloader(
         data=data,
-        num_samples=num_samples,
-        num_hops=num_hops,
-        max_nodes=max_nodes,
-        min_nodes=min_nodes,
+        seed=seed,
         batch_size=batch_size,
         shuffle=True,
-        seed=seed,
     )
 
-    logger.info("Fetching one batch of sampled subgraphs...")
-    batch = next(iter(loader))
+    logger.info("Fetching one training batch...")
 
-    graphs = graphs_from_loader_output(batch)
-    logger.info(f"Loader output contains {len(graphs)} visualizable graph object(s)")
-    logger.info(f"Total nodes in loader output: {batch.num_nodes}")
-    logger.info(f"Total directed edges in loader output: {batch.edge_index.size(1)}")
+    batch = next(iter(train_loader))
 
-    labels_present = sorted(batch.y.detach().cpu().unique().tolist())
+    labels_present = sorted(
+        batch.y.detach().cpu().unique().tolist()
+    )
+
     label_text = ", ".join(
-        f"{int(label)}={label_names().get(int(label), f'Class {int(label)}')}"
+        f"{int(label)}="
+        f"{label_names().get(int(label), f'Class {int(label)}')}"
         for label in labels_present
     )
-    logger.info(f"Paper classes present in batch: {label_text}")
 
-    x_dense, adj_dense, node_mask = dense_from_loader_output(
-        batch=batch,
-        min_nodes=min_nodes,
-        max_nodes=None,
+    logger.info(
+        f"Paper classes present in batch: {label_text}"
     )
-
-    logger.info(f"Dense x shape: {x_dense.shape}")
-    logger.info(f"Dense adj shape: {adj_dense.shape}")
-    logger.info(f"Dense mask shape: {node_mask.shape}")
 
     visualize_batch(
         batch=batch,
@@ -888,17 +502,9 @@ def main(
         seed=seed,
     )
 
-    visualize_dense_batch(
-        adj=adj_dense,
-        node_mask=node_mask,
-        output_path=dense_output_path,
-        max_graphs=max_graphs,
-        seed=seed,
+    logger.success(
+        f"Saved subgraph visualization to {output_path}"
     )
-
-    logger.success(f"Saved subgraph visualization to {output_path}")
-    logger.success(f"Saved dense visualization to {dense_output_path}")
-
 
 if __name__ == "__main__":
     app()

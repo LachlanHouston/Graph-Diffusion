@@ -80,68 +80,30 @@ def disc(samples1, samples2, kernel, is_parallel=True, *args, **kwargs):
 
 
 def compute_mmd(samples1, samples2, kernel, is_hist=True, *args, **kwargs):
-    """ MMD between two samples
+    """ 
+    MMD between two samples
     """
     # normalize histograms into pmf
     if is_hist:
         samples1 = [s1 / np.sum(s1) for s1 in samples1]
         samples2 = [s2 / np.sum(s2) for s2 in samples2]
-    # print('===============================')
-    # print('s1: ', disc(samples1, samples1, kernel, *args, **kwargs))
-    # print('--------------------------')
-    # print('s2: ', disc(samples2, samples2, kernel, *args, **kwargs))
-    # print('--------------------------')
-    # print('cross: ', disc(samples1, samples2, kernel, *args, **kwargs))
-    # print('===============================')
+
     return disc(samples1, samples1, kernel, *args, **kwargs) + \
         disc(samples2, samples2, kernel, *args, **kwargs) - \
         2 * disc(samples1, samples2, kernel, *args, **kwargs)
 
 
 def compute_emd(samples1, samples2, kernel, is_hist=True, *args, **kwargs):
-    """ EMD between average of two samples
+    """ 
+    EMD between average of two samples
     """
 
     # normalize histograms into pmf
     if is_hist:
         samples1 = [np.mean(samples1)]
         samples2 = [np.mean(samples2)]
-    # print('===============================')
-    # print('s1: ', disc(samples1, samples1, kernel, *args, **kwargs))
-    # print('--------------------------')
-    # print('s2: ', disc(samples2, samples2, kernel, *args, **kwargs))
-    # print('--------------------------')
-    # print('cross: ', disc(samples1, samples2, kernel, *args, **kwargs))
-    # print('===============================')
+
     return disc(samples1, samples2, kernel, *args, **kwargs), [samples1[0], samples2[0]]
-
-
-def test():
-    s1 = np.array([0.2, 0.8])
-    s2 = np.array([0.3, 0.7])
-    samples1 = [s1, s2]
-
-    s3 = np.array([0.25, 0.75])
-    s4 = np.array([0.35, 0.65])
-    samples2 = [s3, s4]
-
-    s5 = np.array([0.8, 0.2])
-    s6 = np.array([0.7, 0.3])
-    samples3 = [s5, s6]
-
-    # print('between samples1 and samples2: ', compute_emd(samples1, samples2, kernel=gaussian_emd,
-    #                                                      is_parallel=False, sigma=1.0))
-    # print('between samples1 and samples3: ', compute_emd(samples1, samples3, kernel=gaussian_emd,
-    #                                                      is_parallel=False, sigma=1.0))
-    print('between samples1 and samples2: ', compute_mmd(samples1, samples2, kernel=gaussian,
-                                                         is_parallel=True, sigma=1.0))
-    print('between samples1 and samples3: ', compute_mmd(samples1, samples3, kernel=gaussian,
-                                                         is_parallel=True, sigma=1.0))
-    print('between samples1 and samples2: ', compute_mmd(samples1, samples2, kernel=gaussian,
-                                                         is_parallel=True, sigma=1.0))
-    print('between samples1 and samples3: ', compute_mmd(samples1, samples3, kernel=gaussian,
-                                                         is_parallel=True, sigma=1.0))
-
 
 def process_tensor(x, y):
     support_size = max(len(x), len(y))
@@ -150,7 +112,4 @@ def process_tensor(x, y):
     elif len(y) < len(x):
         y = np.hstack((y, [0.0] * (support_size - len(y))))
     return x, y
-
-
-if __name__ == '__main__':
-    test()
+    

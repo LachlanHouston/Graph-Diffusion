@@ -497,3 +497,99 @@ def masked_multiclass_metrics(
     }
     metrics.update(per_class_metrics)
     return metrics
+
+def node_colours_from_features(x, num_nodes: int, cmap):
+    if x is None:
+        return None
+
+    classes = x.long().flatten().tolist()
+    colours = [cmap(node_class % cmap.N) for node_class in classes]
+
+    if len(colours) != num_nodes:
+        return None
+
+    return colours
+
+def make_sample_figure(
+    real_e,
+    sampled_e,
+    node_mask,
+    num_graphs: int = 2,
+    real_x=None,
+    sampled_x=None,
+    show_node_labels: bool = True,
+):
+    num_graphs = min(num_graphs, real_e.size(0), sampled_e.size(0), node_mask.size(0))
+    cmap = plt.get_cmap("tab10")
+
+    fig, axes = plt.subplots(
+        nrows=2,
+        ncols=num_graphs,
+        figsize=(3.5 * num_graphs, 6.0),
+        squeeze=False,
+    )
+
+    for graph_idx in range(num_graphs):
+        real_feats, real_graph = graph_from_adjacency(
+            real_x[graph_idx] if real_x is not None else None,
+            real_e[graph_idx],
+            node_mask[graph_idx],
+        )
+        sampled_feats, sampled_graph = graph_from_adjacency(
+            sampled_x[graph_idx] if sampled_x is not None else None,
+            sampled_e[graph_idx],
+            node_mask[graph_idx],
+        )
+
+        real_pos = nx.spring_layout(real_graph, seed=42)
+        sampled_pos = nx.spring_layout(sampled_graph, seed=42)
+
+        ax = axes[0, graph_idx]
+        real_labels = None
+        if show_node_labels and real_feats is not None:
+            real_labels = {
+                node_idx: str(int(node_class))
+                for node_idx, node_class in enumerate(real_feats.long().flatten().tolist())
+            }
+        nx.draw_networkx(
+            real_graph,
+            pos=real_pos,
+            node_color=node_colours_from_features(real_feats, real_graph.number_of_nodes(), cmap),
+            ax=ax,
+            node_size=45,
+            labels=real_labels,
+            with_labels=real_labels is not None,
+            font_size=6,
+            font_color="black",
+            width=0.7,
+            alpha=0.8,
+        )
+        ax.set_title(f"Real {graph_idx} | E={real_graph.number_of_edges()}")
+        ax.set_axis_off()
+
+        ax = axes[1, graph_idx]
+        sampled_labels = None
+        if show_node_labels and sampled_feats is not None:
+            sampled_labels = {
+                node_idx: str(int(node_class))
+                for node_idx, node_class in enumerate(sampled_feats.long().flatten().tolist())
+            }
+        nx.draw_networkx(
+            sampled_graph,
+            pos=sampled_pos,
+            node_color=node_colours_from_features(sampled_feats, sampled_graph.number_of_nodes(), cmap),
+            ax=ax,
+            node_size=45,
+            labels=sampled_labels,
+            with_labels=sampled_labels is not None,
+            font_size=6,
+            font_color="black",
+            width=0.7,
+            alpha=0.8,
+        )
+        ax.set_title(f"Sampled {graph_idx} | E={sampled_graph.number_of_edges()}")
+        ax.set_axis_off()
+
+    fig.suptitle("Real vs sampled graphs during training", fontsize=14)
+    fig.tight_layout()
+    return fig
