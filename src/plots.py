@@ -7,15 +7,10 @@ import networkx as nx
 import torch
 import numpy as np
 from torch_geometric.data import Batch, Data
-from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_networkx
 import wandb
 import typer
-import imageio
-import io
-import tempfile
 from sklearn.manifold import TSNE
-import seaborn as sns
 
 from src.config import FIGURES_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR
 from src.dataset_ego import (
@@ -238,6 +233,7 @@ def visualize_batch(
     output_path: Path,
     max_graphs: int = 9,
     seed: int = 42,
+    graph_type: str = "Sampled",
 ) -> None:
     """Visualize a PyG batch as a grid of sampled subgraphs."""
     graphs = graphs_from_loader_output(batch)
@@ -270,9 +266,15 @@ def visualize_batch(
         ax.set_axis_off()
 
     if DATASET == "ego":
-        fig.suptitle(f"Sampled {DATASET} subgraphs colored by paper class", fontsize=64)
+        fig.suptitle(
+            f"{graph_type} {DATASET} subgraphs colored by paper class",
+            fontsize=64,
+        )
     else:
-        fig.suptitle(f"Sampled {DATASET} subgraphs", fontsize=64)
+        fig.suptitle(
+            f"{graph_type} {DATASET} subgraphs",
+            fontsize=64,
+        )
     
     if labels_in_plotted_graphs:
         plotted_labels = torch.tensor(labels_in_plotted_graphs, dtype=torch.long)

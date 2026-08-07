@@ -4,46 +4,28 @@ from torch_geometric.utils import (
     remove_self_loops,
     to_dense_adj,
     to_dense_batch,
+    dense_to_sparse
 )
 
-def compute_structural_features(
+from torch_geometric.data import Batch, Data
+
+def get_root_node(
     graph: nx.Graph,
     root_node: int,
-    max_nodes: int,
 ) -> torch.Tensor:
-    degrees = dict(graph.degree())
-    clustering = nx.clustering(graph)
-    distances = nx.single_source_shortest_path_length(
-        graph,
-        root_node,
-    )
-
-    features = []
+    roots = []
 
     for node in range(graph.number_of_nodes()):
-        normalized_degree = (
-            degrees[node] / max(max_nodes - 1, 1)
-        )
-
-        clustering_coefficient = clustering[node]
-
-        normalized_distance = (
-            distances[node] / max(max(distances.values()), 1)
-        )
-
         is_root = float(node == root_node)
 
-        features.append(
+        roots.append(
             [
-                normalized_degree,
-                clustering_coefficient,
-                normalized_distance,
                 is_root,
             ]
         )
 
     return torch.tensor(
-        features,
+        roots,
         dtype=torch.float,
     )
 
@@ -114,6 +96,225 @@ def estimate_marginal_distributions(
     ).float()
 
     return node_marginals, edge_marginals
+
+def compute_noisy_structural_features(
+    noisy_adj: torch.Tensor,
+    node_mask: torch.Tensor,
+    root_indicator: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute structural node features from the current noisy adjacency.
+
+    Args:
+        noisy_adj:
+            Tensor of shape [batch_size, num_nodes, num_nodes].
+            Edge class 0 is assumed to mean no edge, while values > 0
+            are treated as edges.
+
+        node_mask:
+            Boolean tensor of shape [batch_size, num_nodes].
+
+        root_indicator:
+            Tensor of shape [batch_size, num_nodes] or
+            [batch_size, num_nodes, 1], with exactly one root node
+            marked per graph.
+
+    Returns:
+        Tensor of shape [batch_size, num_nodes, 4] containing:
+
+        0: normalized noisy degree
+        1: noisy clustering coefficient
+        2: normalized noisy distance from the root
+        3: fixed root indicator
+    """
+    if root_indicator.ndim == 3:
+        root_indicator = root_indicator.squeeze(-1)
+
+    node_mask = node_mask.bool()
+
+    batch_size, num_nodes, _ = noisy_adj.shape
+
+    pair_mask = (
+        node_mask.unsqueeze(1)
+        & node_mask.unsqueeze(2)
+    )
+
+    adjacency = (noisy_adj > 0).float()
+
+    adjacency = torch.maximum(
+        adjacency,
+        adjacency.transpose(1, 2),
+    )
+
+    adjacency = adjacency * pair_mask.float()
+
+    diagonal_mask = torch.eye(
+        num_nodes,
+        device=adjacency.device,
+        dtype=torch.bool,
+    ).unsqueeze(0)
+
+    adjacency = adjacency.masked_fill(
+        diagonal_mask,
+        0.0,
+    )
+
+    # ---------------------------------------------------------
+    # Degree
+    # ---------------------------------------------------------
+
+    degrees = adjacency.sum(dim=-1)
+
+    valid_node_counts = (
+        node_mask.sum(dim=-1, keepdim=True).float()
+    )
+
+    degree_denominator = (
+        valid_node_counts - 1
+    ).clamp(min=1)
+
+    normalized_degree = (
+        degrees / degree_denominator
+    )
+
+    # ---------------------------------------------------------
+    # Clustering coefficient
+    # ---------------------------------------------------------
+
+    adjacency_squared = torch.bmm(
+        adjacency,
+        adjacency,
+    )
+
+    triangles_per_node = (
+        adjacency_squared * adjacency
+    ).sum(dim=-1) / 2.0
+
+    possible_neighbor_pairs = (
+        degrees * (degrees - 1)
+    ) / 2.0
+
+    clustering = torch.where(
+        possible_neighbor_pairs > 0,
+        triangles_per_node
+        / possible_neighbor_pairs.clamp(min=1),
+        torch.zeros_like(triangles_per_node),
+    )
+
+    # ---------------------------------------------------------
+    # Root indicator
+    # ---------------------------------------------------------
+
+    root_indicator = (
+        root_indicator.float()
+        * node_mask.float()
+    )
+
+    root_indices = root_indicator.argmax(dim=-1)
+
+    # ---------------------------------------------------------
+    # Shortest-path distance from root
+    # ---------------------------------------------------------
+
+    distances = torch.full(
+        size=(batch_size, num_nodes),
+        fill_value=-1,
+        dtype=torch.long,
+        device=adjacency.device,
+    )
+
+    frontier = torch.zeros(
+        size=(batch_size, num_nodes),
+        dtype=torch.bool,
+        device=adjacency.device,
+    )
+
+    frontier.scatter_(
+        dim=1,
+        index=root_indices.unsqueeze(1),
+        value=True,
+    )
+
+    frontier = frontier & node_mask
+    visited = frontier.clone()
+    distances[frontier] = 0
+    adjacency_bool = adjacency.bool()
+
+    for distance in range(1, num_nodes):
+        next_frontier = torch.bmm(
+            frontier.float().unsqueeze(1),
+            adjacency_bool.float(),
+        ).squeeze(1) > 0
+
+        next_frontier = (
+            next_frontier
+            & node_mask
+            & ~visited
+        )
+
+        if not next_frontier.any():
+            break
+
+        distances[next_frontier] = distance
+
+        visited = visited | next_frontier
+        frontier = next_frontier
+
+    normalized_distance = torch.zeros(
+        size=(batch_size, num_nodes),
+        dtype=adjacency.dtype,
+        device=adjacency.device,
+    )
+
+    for graph_idx in range(batch_size):
+        reachable = (
+            distances[graph_idx] >= 0
+        ) & node_mask[graph_idx]
+
+        if reachable.any():
+            maximum_distance = (
+                distances[graph_idx, reachable]
+                .max()
+                .clamp(min=1)
+            )
+
+            normalized_distance[
+                graph_idx,
+                reachable,
+            ] = (
+                distances[
+                    graph_idx,
+                    reachable,
+                ].float()
+                / maximum_distance.float()
+            )
+
+        unreachable = (
+            node_mask[graph_idx]
+            & ~reachable
+        )
+
+        normalized_distance[
+            graph_idx,
+            unreachable,
+        ] = 1.0
+
+    features = torch.stack(
+        [
+            normalized_degree,
+            clustering,
+            normalized_distance,
+            root_indicator,
+        ],
+        dim=-1,
+    )
+
+    features = (
+        features
+        * node_mask.unsqueeze(-1).float()
+    )
+
+    return features
 
 def to_dense(
     x,
@@ -199,3 +400,71 @@ def to_dense(
     adj = torch.maximum(adj, adj.transpose(1, 2))
 
     return node_features, node_labels, adj, node_mask
+
+
+def sampled_tensors_to_batch(
+    sampled_x: torch.Tensor,
+    sampled_e: torch.Tensor,
+    node_mask: torch.Tensor,
+) -> Batch:
+    """
+    Convert dense sampled node labels and adjacency matrices into a PyG Batch.
+
+    Args:
+        sampled_x:
+            Node labels with shape [batch_size, num_nodes], or one-hot/logit
+            node values with shape [batch_size, num_nodes, num_classes].
+
+        sampled_e:
+            Edge classes with shape [batch_size, num_nodes, num_nodes].
+
+        node_mask:
+            Boolean mask with shape [batch_size, num_nodes].
+
+    Returns:
+        A PyG Batch containing one Data object per sampled graph.
+    """
+    sampled_x = sampled_x.detach().cpu()
+    sampled_e = sampled_e.detach().cpu()
+    node_mask = node_mask.detach().cpu().bool()
+
+    if sampled_x.ndim == 3:
+        sampled_x = sampled_x.argmax(dim=-1)
+
+    data_list = []
+
+    for graph_idx in range(sampled_e.size(0)):
+        valid_mask = node_mask[graph_idx]
+        num_valid_nodes = int(valid_mask.sum().item())
+
+        node_labels = sampled_x[
+            graph_idx,
+            valid_mask,
+        ].long()
+
+        adjacency = sampled_e[
+            graph_idx,
+            :num_valid_nodes,
+            :num_valid_nodes,
+        ]
+
+        adjacency = (adjacency > 0).long()
+
+        adjacency = torch.maximum(
+            adjacency,
+            adjacency.transpose(0, 1),
+        )
+
+        adjacency.fill_diagonal_(0)
+
+        edge_index, _ = dense_to_sparse(adjacency)
+
+        graph = Data(
+            y=node_labels,
+            edge_index=edge_index,
+            num_nodes=num_valid_nodes,
+        )
+
+        data_list.append(graph)
+
+    return Batch.from_data_list(data_list)

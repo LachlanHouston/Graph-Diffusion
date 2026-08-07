@@ -8,10 +8,9 @@ from tqdm import tqdm
 import typer
 
 import torch
-import torch.nn.functional as F
 import wandb
 
-from src.config import MODELS_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR
+from src.config import MODELS_DIR, PROCESSED_DATA_DIR, FIGURES_DIR
 from src.dataset_ego import (
     BASE_EGO_DATASET,
     EGO_DATASET,
@@ -32,27 +31,31 @@ from src.modeling.utils import masked_upper_edge_cross_entropy, masked_node_cros
 
 app = typer.Typer()
 
-DATASET = "community"
+def data_functions(dataset: str):
+    if dataset == "ego":
+        DATASET = "ego"
+        DATASET_NAME = EGO_DATASET
+        BASE_DATASET = BASE_EGO_DATASET
 
-if DATASET == "ego":
-    DATASET_NAME = EGO_DATASET
-    BASE_DATASET = BASE_EGO_DATASET
+        get_data = get_ego_data
+        construct_dataloader = construct_ego_dataloader
+        max_nodes = 18
 
-    get_data = get_ego_data
-    construct_dataloader = construct_ego_dataloader
-    max_nodes = 18
+    elif dataset == "community":
+        DATASET = "community"
+        DATASET_NAME = COMMUNINTY_DATASET
+        BASE_DATASET = "Community-small"
 
-elif DATASET == "community":
-    DATASET_NAME = COMMUNINTY_DATASET
-    BASE_DATASET = "Community-small"
+        get_data = get_community_data
+        construct_dataloader = construct_community_dataloader
+        max_nodes = 20
 
-    get_data = get_community_data
-    construct_dataloader = construct_community_dataloader
-    max_nodes = 20
+    return DATASET, DATASET_NAME, BASE_DATASET, get_data, construct_dataloader, max_nodes
 
 @app.command()
 def main(
     model_prefix: Path = "model_discrete.pt",
+    dataset: str = "community",
     max_epochs: int = 1000,
     batch_size: int = 32,
     min_nodes: int = 1,
@@ -66,15 +69,19 @@ def main(
     lr: float = 1e-4,
     dropout: float = 0.1,
     x_loss_scale: float = 1.0,
+    use_conditioning: bool = True,
     wandb_project: str = "graph-diffusion",
     wandb_entity: str | None = None,
     wandb_run_name: str | None = None,
-    wandb_mode: str = "online",
+    wandb_mode: str = "disabled",
     wandb_log_interval: int = 10,
     seed: int = 42,
     val_seed: int = 0,
 ):
+    DATASET, DATASET_NAME, BASE_DATASET, get_data, construct_dataloader, max_nodes = data_functions(dataset=dataset)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     if DATASET == "ego":
         DEFAULT_INPUT = PROCESSED_DATA_DIR / DATASET_NAME
     else:
@@ -88,7 +95,7 @@ def main(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    train_loader, val_loader, test_loader, node_marginals, edge_marginals = construct_dataloader(
+    train_loader, val_loader, _, node_marginals, edge_marginals = construct_dataloader(
         data=data,
         seed=seed,
         batch_size=batch_size,
@@ -133,6 +140,7 @@ def main(
         num_heads=num_heads,
         dropout=dropout,
         diffusion=diffusion,
+        use_conditioning=use_conditioning,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -348,7 +356,7 @@ def main(
                         t=t,
                         node_mask=node_mask,
                     )
-
+        
                     pred = denoiser(
                         features=f0,
                         x=noised["X_t"],
@@ -492,7 +500,7 @@ def main(
                             real_x = x0.to(device).long()
                             real_e = e0.to(device).long()
                             node_mask = node_mask.to(device)
-                
+
                             sampled, _ = diffusion.sample(
                                             model=denoiser,
                                             features=f0,
@@ -555,8 +563,12 @@ def main(
                         fig,
                         caption=f"Epoch {epoch}",
                     )
-                    
-                    wandb.log({"validation_graphs/sampled": image})
+
+                    if wandb_mode == "online":
+                        wandb.log({"validation_graphs/sampled": image})
+                    else:
+                        fig_path = FIGURES_DIR / f"{DATASET}_{epoch}.png"
+                        plt.savefig(fig_path, dpi=200)
                     plt.close(fig)
 
     last_checkpoint = {

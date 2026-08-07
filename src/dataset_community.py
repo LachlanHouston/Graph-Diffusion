@@ -25,9 +25,8 @@ class CommunitySmallDataset(list):
     def __init__(self, graphs):
         super().__init__(graphs)
 
-        # Community-small is an unattributed topology benchmark.
         self.num_node_classes = 1
-        self.num_node_features = 1
+        self.num_node_features = 2
         self.num_edge_classes = 2
 
 

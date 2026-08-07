@@ -1,16 +1,13 @@
-from pathlib import Path
 import math
 
-from loguru import logger
 import torch.nn.functional as F
 
 import matplotlib.pyplot as plt
 import networkx as nx
+import numpy as np
 
 import torch
 from torch import Tensor
-import wandb
-
 
 # -----------------------------------------------------------------------------
 # Tensor helpers
@@ -75,25 +72,36 @@ def binarize_samples(samples: Tensor, threshold: float):
 
 def graph_from_adjacency(x, e, node_mask):
     """
-    Convert node labels/features and adjacency into a masked NetworkX graph.
+    Convert node features and adjacency into a masked NetworkX graph.
 
-    x may be None. If present, it is masked to the valid nodes and returned as the
-    first output. This is used for node-coloured visualisations.
+    Accepts either torch.Tensor or numpy.ndarray inputs.
     """
-    adj = e.detach().cpu()
-    node_mask = node_mask.detach().cpu().bool()
-    valid_nodes = torch.where(node_mask)[0]
+
+    def to_numpy(a):
+        if a is None:
+            return None
+        if isinstance(a, torch.Tensor):
+            return a.detach().cpu().numpy()
+        return np.asarray(a)
+
+    x = to_numpy(x)
+    e = to_numpy(e)
+    node_mask = to_numpy(node_mask).astype(bool)
+
+    valid_nodes = np.where(node_mask)[0]
 
     feats = None
     if x is not None:
-        feats = x.detach().cpu()[valid_nodes]
+        feats = x[valid_nodes]
 
-    adj = adj[valid_nodes][:, valid_nodes]
-    adj = torch.maximum(adj, adj.transpose(0, 1))
-    adj = (adj > 0.5).int().numpy()
+    adj = e[valid_nodes][:, valid_nodes]
+
+    adj = np.maximum(adj, adj.T)
+    adj = (adj > 0.5).astype(np.int32)
 
     graph = nx.from_numpy_array(adj)
     graph.remove_edges_from(nx.selfloop_edges(graph))
+
     return feats, graph
 
 
@@ -592,4 +600,126 @@ def make_sample_figure(
 
     fig.suptitle("Real vs sampled graphs during training", fontsize=14)
     fig.tight_layout()
+    return fig
+
+def node_label_distribution(
+    labels,
+    node_mask,
+    num_classes: int,
+):
+    """
+    Compute the node-label distribution across a batch of graphs.
+
+    Args:
+        labels:
+            NumPy array with shape [batch_size, num_nodes], or one-hot
+            labels with shape [batch_size, num_nodes, num_classes].
+
+        node_mask:
+            NumPy array with shape [batch_size, num_nodes].
+
+        num_classes:
+            Number of node classes.
+
+    Returns:
+        NumPy array with shape [num_classes].
+    """
+    labels = np.asarray(labels)
+    node_mask = np.asarray(node_mask, dtype=bool)
+
+    if labels.ndim == 3:
+        labels = labels.argmax(axis=-1)
+
+    valid_labels = labels[node_mask].astype(np.int64)
+
+    counts = np.bincount(
+        valid_labels,
+        minlength=num_classes,
+    ).astype(np.float64)
+
+    total = counts.sum()
+
+    if total == 0:
+        return np.zeros(
+            num_classes,
+            dtype=np.float64,
+        )
+
+    return counts / total
+
+
+def total_variation_distance(
+    real_distribution,
+    generated_distribution,
+) -> float:
+    real_distribution = np.asarray(
+        real_distribution,
+        dtype=np.float64,
+    )
+
+    generated_distribution = np.asarray(
+        generated_distribution,
+        dtype=np.float64,
+    )
+
+    if real_distribution.shape != generated_distribution.shape:
+        raise ValueError(
+            "The real and generated distributions must have the same shape."
+        )
+
+    return float(
+        0.5
+        * np.abs(
+            real_distribution - generated_distribution
+        ).sum()
+    )
+
+def plot_node_label_distribution(
+    real_distribution,
+    generated_distribution,
+    conditioning,
+    save_path=None,
+):
+    real_distribution = np.asarray(real_distribution)
+    generated_distribution = np.asarray(generated_distribution)
+
+    if conditioning:
+        experiment = "DDM"
+    else:
+        experiment = "DDMC"
+
+    classes = np.arange(len(real_distribution))
+    width = 0.4
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    ax.bar(
+        classes - width / 2,
+        real_distribution,
+        width,
+        label="Real",
+    )
+
+    ax.bar(
+        classes + width / 2,
+        generated_distribution,
+        width,
+        label="Generated",
+    )
+
+    ax.set_title(f"Node label distribution for {experiment}.", fontsize=18)
+    ax.set_xlabel("Node label", fontsize=14)
+    ax.set_ylabel("Probability", fontsize=14)
+    ax.set_xticks(classes)
+    ax.set_ylim(0, 1)
+    ax.legend()
+
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
     return fig

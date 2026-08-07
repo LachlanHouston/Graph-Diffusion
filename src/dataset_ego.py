@@ -14,7 +14,7 @@ from torch_geometric.utils import (
 )
 
 from src.config import PROCESSED_DATA_DIR, RAW_DATA_DIR
-from src.data_utils import to_dense, compute_structural_features, estimate_marginal_distributions
+from src.data_utils import to_dense, get_root_node, estimate_marginal_distributions
 
 
 EGO_DATASET = "Ego-small"
@@ -65,8 +65,7 @@ def get_ego_data(
         remove_self_loops=True,
     )
 
-    # Keep only the largest connected component, but preserve the original
-    # CiteSeer node IDs. Those IDs are needed to recover x and y.
+    # Keep only the largest connected component
     largest_component_nodes = max(
         nx.connected_components(citation_graph),
         key=len,
@@ -94,7 +93,7 @@ def get_ego_data(
 
         ego_graph.remove_edges_from(nx.selfloop_edges(ego_graph))
 
-        # Keep the original CiteSeer node IDs in a stable order.
+        # Keep the original CiteSeer node IDs in a stable order
         original_node_ids = torch.tensor(
             sorted(ego_graph.nodes()),
             dtype=torch.long,
@@ -116,11 +115,10 @@ def get_ego_data(
         root_local_id = node_mapping[root_node]
         graph_data = from_networkx(local_ego_graph)
 
-        # Original CiteSeer bag-of-words node features.
-        graph_data.x = compute_structural_features(
+        # Root node as feature
+        graph_data.x = get_root_node(
             graph=local_ego_graph,
             root_node=root_local_id,
-            max_nodes=max_nodes,
         )
 
         # Original CiteSeer paper-topic labels.
@@ -128,8 +126,6 @@ def get_ego_data(
             original_node_ids
         ].long()
 
-        # Useful for debugging and tracing generated subgraphs back to
-        # the original citation graph.
         graph_data.original_node_ids = original_node_ids
 
         graph_data.graph_id = torch.tensor(

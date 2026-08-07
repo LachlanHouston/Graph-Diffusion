@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from loguru import logger
 import typer
 
@@ -7,6 +5,8 @@ import math
 import torch
 from torch import nn
 from torch import Tensor
+
+from src.data_utils import compute_noisy_structural_features
 
 app = typer.Typer()
 
@@ -91,47 +91,9 @@ class DiscreteDiffusion(nn.Module):
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
-        if node_marginals is None:
-            node_marginals = torch.full(
-                (x_classes,),
-                1.0 / x_classes,
-                dtype=torch.float,
-            )
-        else:
-            node_marginals = node_marginals.detach().float().clone()
 
-        if edge_marginals is None:
-            edge_marginals = torch.full(
-                (e_classes,),
-                1.0 / e_classes,
-                dtype=torch.float,
-            )
-        else:
-            edge_marginals = edge_marginals.detach().float().clone()
-
-        if node_marginals.shape != (x_classes,):
-            raise ValueError(
-                f"node_marginals must have shape ({x_classes},), "
-                f"got {tuple(node_marginals.shape)}."
-            )
-
-        if edge_marginals.shape != (e_classes,):
-            raise ValueError(
-                f"edge_marginals must have shape ({e_classes},), "
-                f"got {tuple(edge_marginals.shape)}."
-            )
-
-        if (node_marginals < 0).any():
-            raise ValueError("node_marginals cannot contain negative values.")
-
-        if (edge_marginals < 0).any():
-            raise ValueError("edge_marginals cannot contain negative values.")
-
-        if node_marginals.sum() <= 0:
-            raise ValueError("node_marginals must sum to a positive value.")
-
-        if edge_marginals.sum() <= 0:
-            raise ValueError("edge_marginals must sum to a positive value.")
+        node_marginals = node_marginals.detach().float().clone()
+        edge_marginals = edge_marginals.detach().float().clone()
 
         node_marginals = node_marginals / node_marginals.sum()
         edge_marginals = edge_marginals / edge_marginals.sum()
@@ -157,31 +119,6 @@ class DiscreteDiffusion(nn.Module):
         if node_mask is None:
             return None
         return node_mask.to(device=device, dtype=torch.bool)
-
-    def sample_symmetric_edge_classes(self, probs: Tensor) -> Tensor:
-        """
-        Sample one categorical value per undirected node pair and mirror it.
-
-        probs: [B, N, N, K]
-        returns: [B, N, N]
-        """
-        B, N, _, K = probs.shape
-
-        probs = 0.5 * (probs + probs.transpose(1, 2))
-
-        upper_i, upper_j = torch.triu_indices(
-            N,
-            N,
-            offset=1,
-            device=probs.device,
-        )
-        upper_probs = probs[:, upper_i, upper_j, :]  # [B, P, K]
-        upper_samples = self.sample_categorical(upper_probs)  # [B, P]
-
-        e = torch.zeros(B, N, N, dtype=torch.long, device=probs.device)
-        e[:, upper_i, upper_j] = upper_samples
-        e[:, upper_j, upper_i] = upper_samples
-        return e
 
     def get_Qt(self, t: Tensor):
         beta_t = self.betas[t].view(-1, 1, 1)
@@ -218,6 +155,31 @@ class DiscreteDiffusion(nn.Module):
             "X": q_x,
             "E": q_e,
         }
+
+    def sample_symmetric_edge_classes(self, probs: Tensor) -> Tensor:
+        """
+        Sample one categorical value per undirected node pair and mirror it
+
+        probs: [B, N, N, K]
+        returns: [B, N, N]
+        """
+        B, N, _, K = probs.shape
+
+        probs = 0.5 * (probs + probs.transpose(1, 2))
+
+        upper_i, upper_j = torch.triu_indices(
+            N,
+            N,
+            offset=1,
+            device=probs.device,
+        )
+        upper_probs = probs[:, upper_i, upper_j, :]  # [B, P, K]
+        upper_samples = self.sample_categorical(upper_probs)  # [B, P]
+
+        e = torch.zeros(B, N, N, dtype=torch.long, device=probs.device)
+        e[:, upper_i, upper_j] = upper_samples
+        e[:, upper_j, upper_i] = upper_samples
+        return e
 
     def posterior_node_probs(self, pred_x0_probs: Tensor, x_t: Tensor, t: Tensor):
         """
@@ -497,28 +459,10 @@ class DiscreteDiffusion(nn.Module):
         device = torch.device(device)
         node_mask = self._normalize_node_mask(node_mask, device)
 
-        expected_shape = (batch_size, num_nodes)
-        expected_feature_shape = (
-            batch_size,
-            num_nodes,
-            model.feature_dim,
-        )
-
-        if features.shape != expected_feature_shape:
-            raise ValueError(
-                f"features must have shape {expected_feature_shape}, "
-                f"got {tuple(features.shape)}."
-            )
-
         features = features.to(
             device=device,
             dtype=torch.float,
         )
-
-        if node_mask is not None and node_mask.shape != expected_shape:
-            raise ValueError(
-                f"node_mask must have shape {expected_shape}, got {tuple(node_mask.shape)}."
-            )
 
         prior = self.sample_prior(
             batch_size=batch_size,
@@ -624,8 +568,6 @@ class DenseGraphAttentionBlock(nn.Module):
         self.e_add = nn.Linear(e_classes, hidden_dim)
         self.e_mul = nn.Linear(e_classes, hidden_dim)
 
-        # Start from ordinary dot-product attention and let training learn how
-        # edge states should modify the pairwise query-key interaction.
         nn.init.zeros_(self.e_add.weight)
         nn.init.zeros_(self.e_add.bias)
         nn.init.zeros_(self.e_mul.weight)
@@ -722,6 +664,7 @@ class TransformerDenoiser(nn.Module):
         dropout: float = 0.0,
         force_symmetric_output: bool = True,
         diffusion: nn.Module = None,
+        use_conditioning: bool = False,
     ):
         super().__init__()
 
@@ -740,6 +683,7 @@ class TransformerDenoiser(nn.Module):
         self.dropout = dropout
         self.force_symmetric_output = force_symmetric_output
         self.diffusion = diffusion
+        self.use_conditioning = use_conditioning
         if self.diffusion is None:
             raise ValueError(
                 "TransformerDenoiser requires a diffusion instance for log-SNR time conditioning."
@@ -933,8 +877,23 @@ class TransformerDenoiser(nn.Module):
         t: Tensor,
         node_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
+        if self.use_conditioning:
+            cond_features = compute_noisy_structural_features(
+                noisy_adj=adj_noisy,
+                node_mask=node_mask,
+                root_indicator=features,
+            )[:, :, :self.feature_dim]
+        else:
+            cond_features = torch.zeros(
+                features.size(0),
+                features.size(1),
+                self.feature_dim,
+                device=adj_noisy.device,
+                dtype=torch.float,
+            )
+        
         h = self.encode_nodes(
-            features=features,
+            features=cond_features,
             x=x,
             adj_noisy=adj_noisy,
             t=t,
